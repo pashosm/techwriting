@@ -18,7 +18,8 @@ MIN_OBS_FLAT = 3
 MIN_OBS_COND = 8      # Need more obs for regression
 MIN_R2_IMPROVE = 0.05  # Conditioned must improve R² by at least this
 
-df = pd.read_excel('/mnt/user-data/uploads/Dummy_Training_Data_Try_2_11-Feb-2026.xlsx')
+df = pd.read_csv('Dummy Training Data Customer 1 Try 2 11-Feb-2026.csv',
+                 parse_dates=['Reference_Month', 'Target_Period_Start', 'Target_Period_End'])
 if 'Unnamed: 0' in df.columns: df = df.drop(columns=['Unnamed: 0'])
 if 'GSA' not in df.columns: df['GSA'] = 'Customer 1'
 df['gsa_site'] = df['GSA'].astype(str) + '|' + df['Site'].astype(str)
