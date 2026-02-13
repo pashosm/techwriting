@@ -385,11 +385,11 @@ MIN_PROGRESS = 0.05   # Floor to avoid division by near-zero progress
 MAX_CORRECTION = 3.0   # Cap multiplicative correction
 MIN_CORRECTION = 0.2
 
-def apply_progress_correction(dset, oo_f, cov_f, bias_f, ref_ltoe):
-    """V8k: Progress-based multiplicative correction.
-    correction = progress(lt_oe_current, lag) / progress(lt_oe_ref, lag)
-    where progress = max(eps, 1 - lag / lt_oe).
-    Corrected_ratio = flat_ratio * correction.
+def apply_progress_correction(dset, oo_f, cov_f, bias_f, ref_ltoe, power=1.0,
+                              oo_out_col='oo_implied_prog', fc_out_col='fc_implied_prog'):
+    """Progress-based multiplicative correction with power-CDF.
+    correction = (prog_cur / prog_ref)^power
+    power=1.0: uniform CDF (V8k). power<1: front-loaded orders (gentler).
     """
     oo_impl = np.full(len(dset), np.nan)
     fc_impl = np.full(len(dset), np.nan)
@@ -415,7 +415,8 @@ def apply_progress_correction(dset, oo_f, cov_f, bias_f, ref_ltoe):
         if flat_val is not None and ref is not None and ref > 0.5 and lt_oe_cur > 0.5:
             prog_ref = max(MIN_PROGRESS, 1.0 - lag / ref)
             prog_cur = max(MIN_PROGRESS, 1.0 - lag / lt_oe_cur)
-            correction = np.clip(prog_cur / prog_ref, MIN_CORRECTION, MAX_CORRECTION)
+            ratio = np.clip(prog_cur / prog_ref, MIN_CORRECTION, MAX_CORRECTION)
+            correction = ratio ** power
             corrected_ratio = flat_val * correction
             oo_impl[i] = row['Open_Orders'] / corrected_ratio
             stats['corrected'] += 1
@@ -430,11 +431,11 @@ def apply_progress_correction(dset, oo_f, cov_f, bias_f, ref_ltoe):
             if cf and bf and cf > 0.001 and bf > 0.001 and row['Forecast_Value'] > 0:
                 fc_impl[i] = row['Forecast_Value'] / bf / cf; break
 
-    dset['oo_implied_prog'] = np.maximum(oo_impl, 0)
-    dset['fc_implied_prog'] = np.maximum(fc_impl, 0)
+    dset[oo_out_col] = np.maximum(oo_impl, 0)
+    dset[fc_out_col] = np.maximum(fc_impl, 0)
     avg_c = np.mean(stats['corrections']) if stats['corrections'] else 1.0
     med_c = np.median(stats['corrections']) if stats['corrections'] else 1.0
-    print(f"    Corrected: {stats['corrected']}, Flat fallback: {stats['flat_fallback']}, "
+    print(f"    p={power:.1f}: Corrected: {stats['corrected']}, Flat fallback: {stats['flat_fallback']}, "
           f"Avg correction: {avg_c:.3f}, Median: {med_c:.3f}")
     return stats
 
@@ -462,12 +463,16 @@ elag_train = apply_effective_lag(train, oo_flat, cov_flat, bias_flat, ref_lt_oe)
 print("    Test:")
 elag_test = apply_effective_lag(test, oo_flat, cov_flat, bias_flat, ref_lt_oe)
 
-# Apply progress-based correction (V8k)
-print("  Applying progress correction (V8k)...")
-print("    Train:")
-prog_train = apply_progress_correction(train, oo_flat, cov_flat, bias_flat, ref_lt_oe)
-print("    Test:")
-prog_test = apply_progress_correction(test, oo_flat, cov_flat, bias_flat, ref_lt_oe)
+# Apply progress-based correction with power sweep
+P_VALUES = [0.2, 0.3, 0.5, 0.7, 1.0]
+print("  Applying progress correction (power sweep)...")
+for p in P_VALUES:
+    oo_col = f'oo_implied_p{int(p*10)}'
+    fc_col = f'fc_implied_p{int(p*10)}'
+    apply_progress_correction(train, oo_flat, cov_flat, bias_flat, ref_lt_oe,
+                              power=p, oo_out_col=oo_col, fc_out_col=fc_col)
+    apply_progress_correction(test, oo_flat, cov_flat, bias_flat, ref_lt_oe,
+                              power=p, oo_out_col=oo_col, fc_out_col=fc_col)
 
 # ============================================================
 # SIGNAL QUALITY: Conditioned vs Flat
@@ -582,36 +587,54 @@ for gs in top_sites:
     print(f"  {site:>15s} | {fw:>5.1f}%{fb:>+5.0f}% | {ew:>5.1f}%{eb:>+5.0f}% | {ew-fw:>+5.1f}pp")
 
 # ============================================================
-# SIGNAL QUALITY: Progress-corrected OO (V8k)
+# SIGNAL QUALITY: Power-CDF sweep
 # ============================================================
 print(f"\n\n{'='*100}")
-print("SIGNAL QUALITY: OO Progress-corrected vs Flat")
+print("SIGNAL QUALITY: OO Power-CDF correction sweep (p=0 is flat, p=1 is uniform)")
 print("=" * 100)
 
 print(f"\n  {'Signal':>25s} | {'WMAPE':>7s} | {'Bias':>7s} | {'R²':>6s}")
 print("  " + "-" * 55)
-for label, col in [('OO flat', 'oo_implied_flat'), ('OO prog-corr (V8k)', 'oo_implied_prog')]:
-    v = test[test[col].notna() & (test[col]>0) & (test['Actual_Sales']>0) & test['gsa_site'].isin(clean_sites)]
-    y, p = v['Actual_Sales'].values, v[col].values
-    w = np.sum(np.abs(y-p))/np.sum(y)*100
-    b = np.mean((p-y)/y)*100
-    r2 = 1 - np.sum((y-p)**2)/np.sum((y-np.mean(y))**2)
-    print(f"  {label:>25s} | {w:>5.1f}% | {b:>+5.1f}% | {r2:>.3f}")
+label, col = 'OO flat (p=0)', 'oo_implied_flat'
+v = test[test[col].notna() & (test[col]>0) & (test['Actual_Sales']>0) & test['gsa_site'].isin(clean_sites)]
+y_f, p_f = v['Actual_Sales'].values, v[col].values
+ww = np.sum(np.abs(y_f-p_f))/np.sum(y_f)*100
+bb = np.mean((p_f-y_f)/y_f)*100
+r2v = 1 - np.sum((y_f-p_f)**2)/np.sum((y_f-np.mean(y_f))**2)
+print(f"  {label:>25s} | {ww:>5.1f}% | {bb:>+5.1f}% | {r2v:>.3f}")
+for pv in P_VALUES:
+    oo_col = f'oo_implied_p{int(pv*10)}'
+    label = f'OO p={pv:.1f}'
+    v = test[test[oo_col].notna() & (test[oo_col]>0) & (test['Actual_Sales']>0) & test['gsa_site'].isin(clean_sites)]
+    y_v, p_v = v['Actual_Sales'].values, v[oo_col].values
+    ww = np.sum(np.abs(y_v-p_v))/np.sum(y_v)*100
+    bb = np.mean((p_v-y_v)/y_v)*100
+    r2v = 1 - np.sum((y_v-p_v)**2)/np.sum((y_v-np.mean(y_v))**2)
+    print(f"  {label:>25s} | {ww:>5.1f}% | {bb:>+5.1f}% | {r2v:>.3f}")
 
-print(f"\n  OO implied per-site (flat vs progress-corrected):")
-print(f"  {'Site':>15s} | {'Flat':>12s} | {'Prog-corr':>12s} | {'Delta':>8s}")
-print("  " + "-" * 55)
+print(f"\n  OO implied per-site by power (WMAPE / bias):")
+print(f"  {'Site':>10s} | {'flat':>10s}", end="")
+for pv in P_VALUES:
+    print(f" | {'p='+str(pv):>10s}", end="")
+print()
+print("  " + "-" * (14 + 13 * (1 + len(P_VALUES))))
 for gs in top_sites:
     site = gs.split('|')[1]
-    fw, fb, pw, pb = 0, 0, 0, 0
-    for col, lbl in [('oo_implied_flat', 'flat'), ('oo_implied_prog', 'prog')]:
-        v = test[(test['gsa_site']==gs) & test[col].notna() & (test[col]>0) & (test['Actual_Sales']>0)]
-        if len(v) > 0:
-            w = np.sum(np.abs(v['Actual_Sales']-v[col]))/np.sum(v['Actual_Sales'])*100
-            b = np.mean((v[col]-v['Actual_Sales'])/v['Actual_Sales'])*100
-            if lbl == 'flat': fw, fb = w, b
-            else: pw, pb = w, b
-    print(f"  {site:>15s} | {fw:>5.1f}%{fb:>+5.0f}% | {pw:>5.1f}%{pb:>+5.0f}% | {pw-fw:>+5.1f}pp")
+    v = test[(test['gsa_site']==gs) & test['oo_implied_flat'].notna() & (test['oo_implied_flat']>0) & (test['Actual_Sales']>0)]
+    if len(v) == 0: continue
+    fw = np.sum(np.abs(v['Actual_Sales']-v['oo_implied_flat']))/np.sum(v['Actual_Sales'])*100
+    fb = np.mean((v['oo_implied_flat']-v['Actual_Sales'])/v['Actual_Sales'])*100
+    print(f"  {site:>10s} | {fw:>4.0f}%{fb:>+4.0f}%", end="")
+    for pv in P_VALUES:
+        oo_col = f'oo_implied_p{int(pv*10)}'
+        vp = test[(test['gsa_site']==gs) & test[oo_col].notna() & (test[oo_col]>0) & (test['Actual_Sales']>0)]
+        if len(vp) > 0:
+            pw = np.sum(np.abs(vp['Actual_Sales']-vp[oo_col]))/np.sum(vp['Actual_Sales'])*100
+            pb = np.mean((vp[oo_col]-vp['Actual_Sales'])/vp['Actual_Sales'])*100
+            print(f" | {pw:>4.0f}%{pb:>+4.0f}%", end="")
+        else:
+            print(f" | {'n/a':>10s}", end="")
+    print()
 
 # ============================================================
 # WEIGHTED AVERAGE COMBINATION
@@ -701,80 +724,87 @@ test['v8i'] = weighted_avg(test, train, test_months, 'oo_implied_norm', 'fc_impl
 print("  Running V8j (effective lag OO + flat FC)...")
 test['v8j'] = weighted_avg(test, train, test_months, 'oo_implied_elag', 'fc_implied_elag')
 
-# V8k progress-corrected
-print("  Running V8k (progress-corrected OO + flat FC)...")
-test['v8k'] = weighted_avg(test, train, test_months, 'oo_implied_prog', 'fc_implied_prog')
+# Power-CDF sweep through full model
+print("  Running power-CDF sweep through full model...")
+for pv in P_VALUES:
+    oo_col = f'oo_implied_p{int(pv*10)}'
+    fc_col = f'fc_implied_p{int(pv*10)}'
+    col_name = f'v8_p{int(pv*10)}'
+    test[col_name] = weighted_avg(test, train, test_months, oo_col, fc_col)
 
-# V8l: flat curves + visibility-adjusted weighting
-print("  Running V8l (flat curves + visibility weighting)...")
-test['v8l'] = weighted_avg(test, train, test_months, 'oo_implied_flat', 'fc_implied_flat',
-                           visibility_adj=True, ref_ltoe=ref_lt_oe)
-
-# V8m: progress-corrected curves + visibility-adjusted weighting
-print("  Running V8m (prog-corrected + visibility weighting)...")
-test['v8m'] = weighted_avg(test, train, test_months, 'oo_implied_prog', 'fc_implied_prog',
-                           visibility_adj=True, ref_ltoe=ref_lt_oe)
+# Also with visibility weighting at each p
+print("  Running power-CDF + visibility sweep...")
+for pv in P_VALUES:
+    oo_col = f'oo_implied_p{int(pv*10)}'
+    fc_col = f'fc_implied_p{int(pv*10)}'
+    col_name = f'v8_p{int(pv*10)}_vis'
+    test[col_name] = weighted_avg(test, train, test_months, oo_col, fc_col,
+                                  visibility_adj=True, ref_ltoe=ref_lt_oe)
 
 m2 = test['Reference_Month'] > test_months[0]
 
+# Summary table: p sweep
 print(f"\n  {'Model':>20s} | {'WMAPE':>7s} | {'Bias':>7s} | {'R²':>6s} | {'Acct':>6s}")
 print("  " + "-" * 60)
-for label, col in [('V8d (flat)', 'v8d'), ('V8k (prog)', 'v8k'),
-                    ('V8l (flat+vis)', 'v8l'), ('V8m (prog+vis)', 'v8m')]:
-    ts = test[m2 & test[col].notna() & test['gsa_site'].isin(clean_sites)]
-    y, p = ts['Actual_Sales'].values, ts[col].values
-    w = np.sum(np.abs(y-p))/np.sum(y)*100
-    b = np.mean((p-y)/y)*100
-    r2 = 1 - np.sum((y-p)**2)/np.sum((y-np.mean(y))**2)
-    tf12 = ts[(ts['Timeframe']==12)&(ts['Prediction_Lag']==1)]
-    by_m = tf12.groupby('Reference_Month').agg({'Actual_Sales':'sum'})
-    by_m['pr'] = tf12.groupby('Reference_Month').apply(lambda g: test.loc[g.index, col].sum()).values
-    aw = np.sum(np.abs(by_m['Actual_Sales']-by_m['pr']))/np.sum(by_m['Actual_Sales'])*100
-    print(f"  {label:>20s} | {w:>5.1f}% | {b:>+5.1f}% | {r2:>.3f} | {aw:>4.1f}%")
+# V8d baseline
+ts = test[m2 & test['v8d'].notna() & test['gsa_site'].isin(clean_sites)]
+y, p = ts['Actual_Sales'].values, ts['v8d'].values
+w = np.sum(np.abs(y-p))/np.sum(y)*100
+b = np.mean((p-y)/y)*100
+r2 = 1 - np.sum((y-p)**2)/np.sum((y-np.mean(y))**2)
+tf12 = ts[(ts['Timeframe']==12)&(ts['Prediction_Lag']==1)]
+by_m = tf12.groupby('Reference_Month').agg({'Actual_Sales':'sum'})
+by_m['pr'] = tf12.groupby('Reference_Month').apply(lambda g: test.loc[g.index, 'v8d'].sum()).values
+aw = np.sum(np.abs(by_m['Actual_Sales']-by_m['pr']))/np.sum(by_m['Actual_Sales'])*100
+print(f"  {'V8d (flat, p=0)':>20s} | {w:>5.1f}% | {b:>+5.1f}% | {r2:>.3f} | {aw:>4.1f}%")
 
-# Per-site
-print(f"\n  Per-site (months 2+):")
-print(f"  {'Site':>20s} | {'V8d':>12s} | {'V8k':>12s} | {'V8l':>12s} | {'V8m':>12s} | {'d-l':>6s} | {'d-m':>6s}")
-print("  " + "-" * 95)
+for pv in P_VALUES:
+    for suffix, label_sfx in [('', ''), ('_vis', '+vis')]:
+        col = f'v8_p{int(pv*10)}{suffix}'
+        label = f'p={pv}{label_sfx}'
+        ts = test[m2 & test[col].notna() & test['gsa_site'].isin(clean_sites)]
+        y, p = ts['Actual_Sales'].values, ts[col].values
+        w = np.sum(np.abs(y-p))/np.sum(y)*100
+        b = np.mean((p-y)/y)*100
+        r2 = 1 - np.sum((y-p)**2)/np.sum((y-np.mean(y))**2)
+        tf12 = ts[(ts['Timeframe']==12)&(ts['Prediction_Lag']==1)]
+        by_m = tf12.groupby('Reference_Month').agg({'Actual_Sales':'sum'})
+        by_m['pr'] = tf12.groupby('Reference_Month').apply(lambda g: test.loc[g.index, col].sum()).values
+        aw = np.sum(np.abs(by_m['Actual_Sales']-by_m['pr']))/np.sum(by_m['Actual_Sales'])*100
+        print(f"  {label:>20s} | {w:>5.1f}% | {b:>+5.1f}% | {r2:>.3f} | {aw:>4.1f}%")
+
+# Per-site for best candidates (V8d vs p=0.3 vs p=0.3+vis)
+best_p = 0.3
+best_col = f'v8_p{int(best_p*10)}'
+best_vis_col = f'v8_p{int(best_p*10)}_vis'
+print(f"\n  Per-site (months 2+) — V8d vs p={best_p} vs p={best_p}+vis:")
+print(f"  {'Site':>20s} | {'V8d':>12s} | {'p='+str(best_p):>12s} | {'p='+str(best_p)+'+vis':>12s} | {'d-p':>6s} | {'d-pv':>6s}")
+print("  " + "-" * 80)
 for gs in sorted(clean_sites):
     site = gs.split('|')[1]
     sub = test[m2 & (test['gsa_site']==gs) & (test['Actual_Sales']>0)]
     vals = {}
-    for lbl, c in [('d','v8d'),('k','v8k'),('l','v8l'),('m','v8m')]:
+    for lbl, c in [('d','v8d'),('p',best_col),('pv',best_vis_col)]:
         v = sub[sub[c].notna()]
         if len(v) > 0:
             vals[lbl+'w'] = np.sum(np.abs(v['Actual_Sales']-v[c]))/np.sum(v['Actual_Sales'])*100
             vals[lbl+'b'] = np.mean((v[c]-v['Actual_Sales'])/v['Actual_Sales'])*100
-    if all(k in vals for k in ['dw','kw','lw','mw']):
-        print(f"  {site:>20s} | {vals['dw']:>5.1f}%{vals['db']:>+5.0f}% | {vals['kw']:>5.1f}%{vals['kb']:>+5.0f}% | {vals['lw']:>5.1f}%{vals['lb']:>+5.0f}% | {vals['mw']:>5.1f}%{vals['mb']:>+5.0f}% | {vals['lw']-vals['dw']:>+4.1f} | {vals['mw']-vals['dw']:>+4.1f}")
+    if all(k in vals for k in ['dw','pw','pvw']):
+        print(f"  {site:>20s} | {vals['dw']:>5.1f}%{vals['db']:>+5.0f}% | {vals['pw']:>5.1f}%{vals['pb']:>+5.0f}% | {vals['pvw']:>5.1f}%{vals['pvb']:>+5.0f}% | {vals['pw']-vals['dw']:>+4.1f} | {vals['pvw']-vals['dw']:>+4.1f}")
 
-# Per-lag
-print(f"\n  WMAPE by lag:")
-print(f"  {'Lag':>4s} | {'V8d':>8s} | {'V8k':>8s} | {'V8l':>8s} | {'V8m':>8s} | {'d-l':>6s} | {'d-m':>6s}")
-print("  " + "-" * 60)
+# Per-lag for best candidate
+print(f"\n  WMAPE by lag — V8d vs p={best_p} vs p={best_p}+vis:")
+print(f"  {'Lag':>4s} | {'V8d':>8s} | {'p='+str(best_p):>8s} | {'p='+str(best_p)+'+v':>8s} | {'d-p':>6s} | {'d-pv':>6s}")
+print("  " + "-" * 50)
 for lag in sorted(test['Prediction_Lag'].unique()):
     sub = test[m2 & (test['Prediction_Lag']==lag) & (test['Actual_Sales']>0) & test['gsa_site'].isin(clean_sites)]
     vals = {}
-    for lbl, c in [('d','v8d'),('k','v8k'),('l','v8l'),('m','v8m')]:
+    for lbl, c in [('d','v8d'),('p',best_col),('pv',best_vis_col)]:
         v = sub[sub[c].notna()]
         if len(v) > 0:
             vals[lbl] = np.sum(np.abs(v['Actual_Sales']-v[c]))/np.sum(v['Actual_Sales'])*100
-    if all(k in vals for k in ['d','k','l','m']):
-        print(f"  {lag:>4d} | {vals['d']:>6.1f}% | {vals['k']:>6.1f}% | {vals['l']:>6.1f}% | {vals['m']:>6.1f}% | {vals['l']-vals['d']:>+4.1f} | {vals['m']-vals['d']:>+4.1f}")
-
-# Account monthly
-print(f"\n  Account TF=12/L=1:")
-print(f"  {'Month':>12s} | {'Actual':>8s} | {'V8d':>15s} | {'V8l':>15s} | {'V8m':>15s}")
-print("  " + "-" * 80)
-for ref in test_months[:7]:
-    sub = test[(test['Reference_Month']==ref) & (test['Timeframe']==12) &
-                (test['Prediction_Lag']==1) & test['gsa_site'].isin(clean_sites)]
-    act = sub['Actual_Sales'].sum()
-    bp = sub['v8d'].sum()
-    lp = sub['v8l'].sum()
-    mp = sub['v8m'].sum()
-    if act > 0:
-        print(f"  {ref.date()} | ${act/1e6:>5.0f}M | ${bp/1e6:>5.0f}M ({(bp-act)/act*100:>+5.1f}%) | ${lp/1e6:>5.0f}M ({(lp-act)/act*100:>+5.1f}%) | ${mp/1e6:>5.0f}M ({(mp-act)/act*100:>+5.1f}%)")
+    if all(k in vals for k in ['d','p','pv']):
+        print(f"  {lag:>4d} | {vals['d']:>6.1f}% | {vals['p']:>6.1f}% | {vals['pv']:>6.1f}% | {vals['p']-vals['d']:>+4.1f} | {vals['pv']-vals['d']:>+4.1f}")
 
 print(f"\n\nV7 reference: WMAPE=8.8%  bias=+0.5%  Acct=2.2%")
 print("\nDone!")
