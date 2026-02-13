@@ -1,11 +1,15 @@
 """
-V8g: Aging curves conditioned on Lead Time and Earliness
-=========================================================
-Instead of: OO_ratio(site, TF, lag) = flat average
-Now:         OO_ratio(site, TF, lag) = α + β₁·LT + β₂·OE
+V8h: Pre-Curve LT Normalization (Site-Specific)
+================================================
+Instead of conditioning curves on LT (V8g -- overfits with per-cell regression),
+normalize Open Orders by LT BEFORE applying flat aging curves.
 
-Same for FC coverage and FC bias.
-Falls back to flat curve when insufficient data or poor fit.
+    OO_norm = OO * (LT_ref / LT_current) ^ beta_site
+
+Then flat curves operate on LT-neutral signals.
+FC curves left flat (stable per development log).
+
+Falls back to beta=0 (pure V8d) when LT signal is weak for a site.
 """
 
 import pandas as pd
@@ -16,8 +20,8 @@ from numpy.linalg import lstsq
 
 RECENCY_POWER = 2
 MIN_OBS_FLAT = 3
-MIN_OBS_COND = 8      # Need more obs for regression
-MIN_R2_IMPROVE = 0.05  # Conditioned must improve R² by at least this
+MIN_OBS_ELASTICITY = 50   # Need substantial data to learn site-level elasticity
+MIN_R2_ELASTICITY = 0.02  # Minimum R² to trust the elasticity
 
 df = pd.read_excel('/mnt/user-data/uploads/Dummy_Training_Data_Try_2_11-Feb-2026.xlsx')
 
@@ -45,75 +49,26 @@ test = df[df['Reference_Month'] > cutoff].copy()
 test_months = sorted(test['Reference_Month'].unique())
 gsa_sites = sorted(df['gsa_site'].unique())
 
+
 # ============================================================
-# BUILD CONDITIONED CURVES
+# FLAT CURVE BUILDER (shared by V8d baseline and V8h)
 # ============================================================
 
-def build_conditioned_curves(train_df, ratio_col, start=None):
-    """Build both flat and LT+OE conditioned curves.
-    Returns: flat_curves, cond_curves
-    flat: {(gs, tf, lag): value}
-    cond: {(gs, tf, lag): {'alpha': a, 'beta_lt': b1, 'beta_oe': b2, 'r2_gain': r2diff}}
+def build_flat_curves(train_df, ratio_col, start=None):
+    """Build recency-weighted flat curves per (site, TF, lag) with TF-pooled fallbacks.
+    Returns: {(gs, tf, lag): value, ('FB', gs, lag): value}
     """
     td = train_df if start is None else train_df[train_df['Reference_Month'] >= start]
     flat = {}
-    cond = {}
 
+    # Per-cell curves
     for (gs, tf, lag), grp in td.groupby(['gsa_site', 'Timeframe', 'Prediction_Lag']):
-        valid = grp[grp[ratio_col].notna() & (grp[ratio_col] > 0) & (grp[ratio_col] < 10)].copy()
-
+        valid = grp[grp[ratio_col].notna() & (grp[ratio_col] > 0) & (grp[ratio_col] < 10)]
         if len(valid) < MIN_OBS_FLAT:
             continue
-
-        # Flat curve (recency-weighted)
         days = (valid['Reference_Month'] - valid['Reference_Month'].min()).dt.days / 365
         wts = (1 + days.values) ** RECENCY_POWER
-        flat_val = np.average(valid[ratio_col], weights=wts)
-        flat[(gs, tf, lag)] = flat_val
-
-        # Conditioned curve: weighted regression
-        if len(valid) >= MIN_OBS_COND:
-            y = valid[ratio_col].values
-            lt = valid['Avg_Weighted_Lead_Time'].values
-            oe = valid['Avg_Weighted_Order_Earliness'].values
-
-            # Check variance in predictors
-            if np.std(lt) < 0.1 and np.std(oe) < 0.1:
-                continue
-
-            # Weighted least squares: ratio = alpha + beta_lt * LT + beta_oe * OE
-            X = np.column_stack([np.ones(len(valid)), lt, oe])
-            W = np.diag(np.sqrt(wts))
-            Xw = W @ X
-            yw = W @ y
-
-            try:
-                coef, _, _, _ = lstsq(Xw, yw, rcond=None)
-                pred_cond = X @ coef
-                pred_flat = np.full(len(y), flat_val)
-
-                ss_tot = np.sum(wts * (y - np.average(y, weights=wts))**2)
-                ss_res_flat = np.sum(wts * (y - pred_flat)**2)
-                ss_res_cond = np.sum(wts * (y - pred_cond)**2)
-
-                r2_flat = 1 - ss_res_flat / ss_tot if ss_tot > 0 else 0
-                r2_cond = 1 - ss_res_cond / ss_tot if ss_tot > 0 else 0
-
-                if r2_cond - r2_flat >= MIN_R2_IMPROVE:
-                    cond[(gs, tf, lag)] = {
-                        'alpha': coef[0],
-                        'beta_lt': coef[1],
-                        'beta_oe': coef[2],
-                        'r2_gain': r2_cond - r2_flat,
-                        'r2_cond': r2_cond,
-                        'flat_val': flat_val,
-                        'lt_mean': np.mean(lt),
-                        'oe_mean': np.mean(oe),
-                        'y_min': np.min(y),
-                        'y_max': np.max(y),
-                    }
-            except:
-                pass
+        flat[(gs, tf, lag)] = np.average(valid[ratio_col], weights=wts)
 
     # Fallback curves (pooled across TFs)
     for (gs, lag), grp in td.groupby(['gsa_site', 'Prediction_Lag']):
@@ -123,191 +78,200 @@ def build_conditioned_curves(train_df, ratio_col, start=None):
             wts = (1 + days.values) ** RECENCY_POWER
             flat[('FB', gs, lag)] = np.average(valid[ratio_col], weights=wts)
 
-            if len(valid) >= MIN_OBS_COND:
-                y = valid[ratio_col].values
-                lt = valid['Avg_Weighted_Lead_Time'].values
-                oe = valid['Avg_Weighted_Order_Earliness'].values
-                if np.std(lt) > 0.1 or np.std(oe) > 0.1:
-                    X = np.column_stack([np.ones(len(valid)), lt, oe])
-                    W = np.diag(np.sqrt(wts))
-                    try:
-                        coef, _, _, _ = lstsq(W @ X, W @ y, rcond=None)
-                        flat_val = flat[('FB', gs, lag)]
-                        pred_cond = X @ coef
-                        ss_tot = np.sum(wts * (y - np.average(y, weights=wts))**2)
-                        ss_res_flat = np.sum(wts * (y - flat_val)**2)
-                        ss_res_cond = np.sum(wts * (y - pred_cond)**2)
-                        r2_flat = 1 - ss_res_flat / ss_tot if ss_tot > 0 else 0
-                        r2_cond = 1 - ss_res_cond / ss_tot if ss_tot > 0 else 0
-                        if r2_cond - r2_flat >= MIN_R2_IMPROVE:
-                            cond[('FB', gs, lag)] = {
-                                'alpha': coef[0], 'beta_lt': coef[1], 'beta_oe': coef[2],
-                                'r2_gain': r2_cond - r2_flat, 'r2_cond': r2_cond,
-                                'flat_val': flat_val, 'lt_mean': np.mean(lt), 'oe_mean': np.mean(oe),
-                                'y_min': np.min(y), 'y_max': np.max(y),
-                            }
-                    except:
-                        pass
-
-    return flat, cond
+    return flat
 
 
-def get_curve_value(flat, cond, gs, tf, lag, lt, oe):
-    """Get curve value: use conditioned if available, else flat, else fallback."""
+def get_flat_value(flat, gs, tf, lag):
+    """Look up flat curve: cell-level first, then TF-pooled fallback."""
     for key in [(gs, tf, lag), ('FB', gs, lag)]:
-        if key in cond:
-            m = cond[key]
-            val = m['alpha'] + m['beta_lt'] * lt + m['beta_oe'] * oe
-            # Clip to reasonable range based on training data
-            val = np.clip(val, max(m['y_min'] * 0.5, 0.001), m['y_max'] * 1.5)
-            return val, 'cond'
         if key in flat:
-            return flat[key], 'flat'
-    return None, None
+            return flat[key]
+    return None
 
-
-print("=" * 100)
-print("V8g: BUILDING CONDITIONED AGING CURVES")
-print("=" * 100)
-
-# Build curves
-oo_flat, oo_cond = build_conditioned_curves(train, 'oo_ratio', start='2023-01-01')
-cov_flat, cov_cond = build_conditioned_curves(train, 'fc_coverage')
-bias_flat, bias_cond = build_conditioned_curves(train, 'fc_bias')
-
-print(f"\n  OO curves:  {len(oo_flat)} flat, {len(oo_cond)} conditioned")
-print(f"  FC cov:     {len(cov_flat)} flat, {len(cov_cond)} conditioned")
-print(f"  FC bias:    {len(bias_flat)} flat, {len(bias_cond)} conditioned")
-
-# Show conditioned curve details for top sites
-print(f"\n  Conditioned OO curves (top sites):")
-print(f"  {'Key':>30s} | {'α':>6s} | {'β_LT':>7s} | {'β_OE':>7s} | {'R² gain':>8s} | {'R² cond':>8s}")
-print("  " + "-" * 80)
-for key in sorted(oo_cond.keys()):
-    gs = key[0] if isinstance(key[0], str) and '|' in key[0] else key[1] if len(key) > 1 and isinstance(key[1], str) and '|' in key[1] else None
-    if gs and gs in top_sites:
-        m = oo_cond[key]
-        kstr = f"{key}"[:30]
-        print(f"  {kstr:>30s} | {m['alpha']:>+5.3f} | {m['beta_lt']:>+6.4f} | {m['beta_oe']:>+6.4f} | {m['r2_gain']:>+6.3f} | {m['r2_cond']:>6.3f}")
 
 # ============================================================
-# APPLY CURVES AND COMPUTE IMPLIED ACTUALS
+# STEP 1: LEARN SITE-SPECIFIC LT ELASTICITY
 # ============================================================
 
-def apply_curves(dset, oo_f, oo_c, cov_f, cov_c, bias_f, bias_c):
-    """Apply conditioned curves to compute implied actuals."""
+def learn_lt_elasticity(train_df, flat_curves, start=None):
+    """Learn per-site power-law elasticity: how OO ratio scales with LT.
+
+    For each site, pools across all (TF, lag) cells:
+        deviation = oo_ratio / flat_curve_value   (removes cell base rate)
+        log(deviation) ~ beta_lt * log(LT / LT_ref)
+
+    Returns: {gsa_site: {'beta_lt', 'lt_ref', 'r2', 'n_obs'}}
+    """
+    td = train_df if start is None else train_df[train_df['Reference_Month'] >= start]
+    elasticities = {}
+
+    for gs in sorted(td['gsa_site'].unique()):
+        site_data = td[td['gsa_site'] == gs].copy()
+
+        # For each row, get the flat curve value and compute deviation
+        devs = []
+        lts = []
+        wts = []
+
+        ref_month_min = site_data['Reference_Month'].min()
+
+        for _, row in site_data.iterrows():
+            if np.isnan(row['oo_ratio']) or row['oo_ratio'] <= 0 or row['oo_ratio'] >= 10:
+                continue
+            flat_val = get_flat_value(flat_curves, gs, row['Timeframe'], row['Prediction_Lag'])
+            if flat_val is None or flat_val <= 0.001:
+                continue
+            lt = row['Avg_Weighted_Lead_Time']
+            if lt <= 0.1:
+                continue
+
+            dev = row['oo_ratio'] / flat_val
+            days = (row['Reference_Month'] - ref_month_min).days / 365
+            w = (1 + days) ** RECENCY_POWER
+
+            devs.append(dev)
+            lts.append(lt)
+            wts.append(w)
+
+        devs = np.array(devs)
+        lts = np.array(lts)
+        wts = np.array(wts)
+
+        if len(devs) < MIN_OBS_ELASTICITY:
+            elasticities[gs] = {'beta_lt': 0.0, 'lt_ref': 1.0, 'r2': 0.0, 'n_obs': len(devs)}
+            continue
+
+        # LT reference = recency-weighted mean
+        lt_ref = np.average(lts, weights=wts)
+
+        # Fit in log space: log(deviation) ~ beta * log(LT / LT_ref)
+        log_dev = np.log(devs)
+        log_lt_ratio = np.log(lts / lt_ref)
+
+        # Weighted OLS (single predictor, no intercept -- deviation should be 1.0 at LT_ref)
+        W = np.sqrt(wts)
+        Xw = W * log_lt_ratio
+        yw = W * log_dev
+
+        # beta = sum(Xw * yw) / sum(Xw * Xw)
+        denom = np.sum(Xw * Xw)
+        if denom < 1e-10:
+            elasticities[gs] = {'beta_lt': 0.0, 'lt_ref': lt_ref, 'r2': 0.0, 'n_obs': len(devs)}
+            continue
+
+        beta_lt = np.sum(Xw * yw) / denom
+
+        # R² (weighted)
+        pred = beta_lt * log_lt_ratio
+        ss_res = np.sum(wts * (log_dev - pred) ** 2)
+        ss_tot = np.sum(wts * (log_dev - np.average(log_dev, weights=wts)) ** 2)
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+
+        # Gate: if R² too low or beta physically wrong (negative = higher LT means lower ratio??)
+        if r2 < MIN_R2_ELASTICITY or beta_lt < 0:
+            elasticities[gs] = {'beta_lt': 0.0, 'lt_ref': lt_ref, 'r2': r2, 'n_obs': len(devs)}
+        else:
+            elasticities[gs] = {'beta_lt': beta_lt, 'lt_ref': lt_ref, 'r2': r2, 'n_obs': len(devs)}
+
+    return elasticities
+
+
+# ============================================================
+# STEP 2: NORMALIZE OO BY LT
+# ============================================================
+
+def normalize_oo_column(df, elasticities, oo_col='Open_Orders', actual_col='Actual_Sales'):
+    """Normalize Open Orders by LT: OO_norm = OO * (LT_ref / LT)^beta.
+    Also computes oo_ratio_norm = OO_norm / Actual (for training data curve building).
+    """
+    oo_norm = df[oo_col].values.copy().astype(float)
+    oo_ratio_norm = np.full(len(df), np.nan)
+
+    for i, (idx, row) in enumerate(df.iterrows()):
+        gs = row['gsa_site']
+        lt = row['Avg_Weighted_Lead_Time']
+
+        if gs not in elasticities:
+            continue
+
+        e = elasticities[gs]
+        beta = e['beta_lt']
+        lt_ref = e['lt_ref']
+
+        if beta == 0.0 or lt <= 0.1:
+            continue
+
+        # Power-law normalization
+        adjustment = (lt_ref / lt) ** beta
+        oo_norm[i] = row[oo_col] * adjustment
+
+        if row[actual_col] > 0:
+            oo_ratio_norm[i] = oo_norm[i] / row[actual_col]
+
+    df['OO_norm'] = oo_norm
+    df['oo_ratio_norm'] = oo_ratio_norm
+
+
+# ============================================================
+# APPLY CURVES (V8d flat baseline and V8h LT-normalized)
+# ============================================================
+
+def apply_flat_curves(dset, oo_flat, cov_flat, bias_flat, oo_col='Open_Orders',
+                      oo_out='oo_implied_flat', fc_out='fc_implied_flat'):
+    """Apply flat curves to compute implied actuals (V8d baseline path)."""
     oo_impl = np.full(len(dset), np.nan)
     fc_impl = np.full(len(dset), np.nan)
-    oo_types = {'cond': 0, 'flat': 0}
-    fc_types = {'cond': 0, 'flat': 0}
 
     for i, (idx, row) in enumerate(dset.iterrows()):
         gs, tf, lag = row['gsa_site'], row['Timeframe'], row['Prediction_Lag']
-        lt, oe = row['Avg_Weighted_Lead_Time'], row['Avg_Weighted_Order_Earliness']
 
         # OO implied
-        f, ftype = get_curve_value(oo_f, oo_c, gs, tf, lag, lt, oe)
-        if f and f > 0.001:
-            oo_impl[i] = row['Open_Orders'] / f
-            if ftype: oo_types[ftype] += 1
+        oo_curve = get_flat_value(oo_flat, gs, tf, lag)
+        if oo_curve and oo_curve > 0.001:
+            oo_impl[i] = row[oo_col] / oo_curve
 
         # FC implied
-        cf, cft = get_curve_value(cov_f, cov_c, gs, tf, lag, lt, oe)
-        bf, bft = get_curve_value(bias_f, bias_c, gs, tf, lag, lt, oe)
+        cf = get_flat_value(cov_flat, gs, tf, lag)
+        bf = get_flat_value(bias_flat, gs, tf, lag)
         if cf and bf and cf > 0.001 and bf > 0.001 and row['Forecast_Value'] > 0:
             fc_impl[i] = row['Forecast_Value'] / bf / cf
-            fc_types['cond' if cft == 'cond' or bft == 'cond' else 'flat'] += 1
 
-    dset['oo_implied'] = np.maximum(oo_impl, 0)
-    dset['fc_implied'] = np.maximum(fc_impl, 0)
-    return oo_types, fc_types
+    dset[oo_out] = np.maximum(oo_impl, 0)
+    dset[fc_out] = np.maximum(fc_impl, 0)
 
 
-# Also build flat-only (V8d baseline) for comparison
-oo_flat_only, _ = build_conditioned_curves(train, 'oo_ratio', start='2023-01-01')
-
-# Force no conditioned curves for baseline
-def apply_flat_only(dset, oo_f, cov_f, bias_f):
+def apply_v8h_curves(dset, oo_norm_flat, cov_flat, bias_flat, elasticities):
+    """Apply V8h: LT-normalize OO, then use normalized flat curves. FC unchanged."""
     oo_impl = np.full(len(dset), np.nan)
     fc_impl = np.full(len(dset), np.nan)
+
     for i, (idx, row) in enumerate(dset.iterrows()):
         gs, tf, lag = row['gsa_site'], row['Timeframe'], row['Prediction_Lag']
-        for key in [(gs, tf, lag), ('FB', gs, lag)]:
-            if key in oo_f:
-                oo_impl[i] = row['Open_Orders'] / oo_f[key] if oo_f[key] > 0.001 else np.nan
-                break
-        for key in [(gs, tf, lag), ('FB', gs, lag)]:
-            cf = cov_f.get(key)
-            bf = bias_f.get(key)
-            if cf and bf and cf > 0.001 and bf > 0.001 and row['Forecast_Value'] > 0:
-                fc_impl[i] = row['Forecast_Value'] / bf / cf
-                break
-    dset['oo_implied_flat'] = np.maximum(oo_impl, 0)
-    dset['fc_implied_flat'] = np.maximum(fc_impl, 0)
+        lt = row['Avg_Weighted_Lead_Time']
 
+        # OO implied (LT-normalized)
+        oo_curve = get_flat_value(oo_norm_flat, gs, tf, lag)
+        if oo_curve and oo_curve > 0.001:
+            e = elasticities.get(gs, {'beta_lt': 0.0, 'lt_ref': 1.0})
+            beta = e['beta_lt']
+            lt_ref = e['lt_ref']
 
-# Apply conditioned curves
-print("\n--- Applying curves ---")
-oo_t, fc_t = apply_curves(train, oo_flat, oo_cond, cov_flat, cov_cond, bias_flat, bias_cond)
-oo_te, fc_te = apply_curves(test, oo_flat, oo_cond, cov_flat, cov_cond, bias_flat, bias_cond)
-print(f"  Test OO: {oo_te}")
-print(f"  Test FC: {fc_te}")
+            lt_safe = max(lt, 0.1)
+            oo_norm = row['Open_Orders'] * (lt_ref / lt_safe) ** beta
+            oo_impl[i] = oo_norm / oo_curve
 
-# Apply flat curves for baseline
-apply_flat_only(train, oo_flat, cov_flat, bias_flat)
-apply_flat_only(test, oo_flat, cov_flat, bias_flat)
+        # FC implied (unchanged -- flat curves on raw data)
+        cf = get_flat_value(cov_flat, gs, tf, lag)
+        bf = get_flat_value(bias_flat, gs, tf, lag)
+        if cf and bf and cf > 0.001 and bf > 0.001 and row['Forecast_Value'] > 0:
+            fc_impl[i] = row['Forecast_Value'] / bf / cf
 
-# ============================================================
-# SIGNAL QUALITY: Conditioned vs Flat
-# ============================================================
-
-print(f"\n\n{'='*100}")
-print("SIGNAL QUALITY: Conditioned vs Flat curves")
-print("=" * 100)
-
-print(f"\n  {'Signal':>25s} | {'WMAPE':>7s} | {'Bias':>7s} | {'R²':>6s}")
-print("  " + "-" * 55)
-for label, col in [('OO flat', 'oo_implied_flat'), ('OO conditioned', 'oo_implied'),
-                    ('FC flat', 'fc_implied_flat'), ('FC conditioned', 'fc_implied')]:
-    v = test[test[col].notna() & (test[col]>0) & (test['Actual_Sales']>0) & test['gsa_site'].isin(clean_sites)]
-    y, p = v['Actual_Sales'].values, v[col].values
-    w = np.sum(np.abs(y-p))/np.sum(y)*100
-    b = np.mean((p-y)/y)*100
-    r2 = 1 - np.sum((y-p)**2)/np.sum((y-np.mean(y))**2)
-    print(f"  {label:>25s} | {w:>5.1f}% | {b:>+5.1f}% | {r2:>.3f}")
-
-# Per site
-print(f"\n  OO implied per-site:")
-print(f"  {'Site':>15s} | {'Flat':>12s} | {'Conditioned':>12s} | {'Delta':>8s}")
-print("  " + "-" * 55)
-for gs in top_sites:
-    site = gs.split('|')[1]
-    for col, lbl in [('oo_implied_flat', 'flat'), ('oo_implied', 'cond')]:
-        v = test[(test['gsa_site']==gs) & test[col].notna() & (test[col]>0) & (test['Actual_Sales']>0)]
-        if len(v) > 0:
-            w = np.sum(np.abs(v['Actual_Sales']-v[col]))/np.sum(v['Actual_Sales'])*100
-            b = np.mean((v[col]-v['Actual_Sales'])/v['Actual_Sales'])*100
-            if lbl == 'flat': fw, fb = w, b
-            else: cw, cb = w, b
-    print(f"  {site:>15s} | {fw:>5.1f}%{fb:>+5.0f}% | {cw:>5.1f}%{cb:>+5.0f}% | {cw-fw:>+5.1f}pp")
-
-print(f"\n  FC implied per-site:")
-print(f"  {'Site':>15s} | {'Flat':>12s} | {'Conditioned':>12s} | {'Delta':>8s}")
-print("  " + "-" * 55)
-for gs in top_sites:
-    site = gs.split('|')[1]
-    for col, lbl in [('fc_implied_flat', 'flat'), ('fc_implied', 'cond')]:
-        v = test[(test['gsa_site']==gs) & test[col].notna() & (test[col]>0) & (test['Actual_Sales']>0)]
-        if len(v) > 0:
-            w = np.sum(np.abs(v['Actual_Sales']-v[col]))/np.sum(v['Actual_Sales'])*100
-            b = np.mean((v[col]-v['Actual_Sales'])/v['Actual_Sales'])*100
-            if lbl == 'flat': fw, fb = w, b
-            else: cw, cb = w, b
-    print(f"  {site:>15s} | {fw:>5.1f}%{fb:>+5.0f}% | {cw:>5.1f}%{cb:>+5.0f}% | {cw-fw:>+5.1f}pp")
+    dset['oo_implied_v8h'] = np.maximum(oo_impl, 0)
+    dset['fc_implied_v8h'] = np.maximum(fc_impl, 0)
 
 
 # ============================================================
-# WEIGHTED AVERAGE COMBINATION
+# WEIGHTED AVERAGE COMBINATION (unchanged from V8d)
 # ============================================================
 
 def weighted_avg(test_df, train_df, test_months, oo_col='oo_implied', fc_col='fc_implied'):
@@ -362,23 +326,129 @@ def weighted_avg(test_df, train_df, test_months, oo_col='oo_implied', fc_col='fc
     return results['pred']
 
 
+# ============================================================
+# MAIN PIPELINE
+# ============================================================
+
+print("=" * 100)
+print("V8h: PRE-CURVE LT NORMALIZATION (SITE-SPECIFIC)")
+print("=" * 100)
+
+# --- V8d baseline: flat curves on raw data ---
+print("\n--- Building V8d baseline (flat curves on raw OO) ---")
+oo_flat_raw = build_flat_curves(train, 'oo_ratio', start='2023-01-01')
+cov_flat = build_flat_curves(train, 'fc_coverage')
+bias_flat = build_flat_curves(train, 'fc_bias')
+print(f"  OO flat curves: {len(oo_flat_raw)}")
+print(f"  FC cov curves:  {len(cov_flat)}")
+print(f"  FC bias curves: {len(bias_flat)}")
+
+# --- Step 1: Learn LT elasticity per site ---
+print("\n--- Step 1: Learning site-specific LT elasticity ---")
+elasticities = learn_lt_elasticity(train, oo_flat_raw, start='2023-01-01')
+
+print(f"\n  {'Site':>25s} | {'β_LT':>7s} | {'LT_ref':>7s} | {'R²':>6s} | {'N obs':>6s} | {'Status':>10s}")
+print("  " + "-" * 75)
+for gs in sorted(elasticities.keys()):
+    e = elasticities[gs]
+    site = gs.split('|')[1] if '|' in gs else gs
+    status = "ACTIVE" if e['beta_lt'] > 0 else "flat (β=0)"
+    print(f"  {site:>25s} | {e['beta_lt']:>+6.3f} | {e['lt_ref']:>6.2f} | {e['r2']:>.3f} | {e['n_obs']:>5d} | {status:>10s}")
+
+# --- Step 2: Normalize OO in training data ---
+print("\n--- Step 2: Normalizing OO by LT in training data ---")
+normalize_oo_column(train, elasticities)
+
+# Show effect of normalization on ratio variance
+print(f"\n  Ratio variance reduction (top sites):")
+print(f"  {'Site':>15s} | {'Raw std':>9s} | {'Norm std':>9s} | {'Reduction':>10s}")
+print("  " + "-" * 50)
+for gs in top_sites:
+    site = gs.split('|')[1]
+    raw = train[(train['gsa_site']==gs) & train['oo_ratio'].notna() & (train['oo_ratio']>0) & (train['oo_ratio']<10)]
+    norm = train[(train['gsa_site']==gs) & train['oo_ratio_norm'].notna() & (train['oo_ratio_norm']>0) & (train['oo_ratio_norm']<10)]
+    if len(raw) > 0 and len(norm) > 0:
+        raw_std = np.std(raw['oo_ratio'])
+        norm_std = np.std(norm['oo_ratio_norm'])
+        reduction = (1 - norm_std / raw_std) * 100 if raw_std > 0 else 0
+        print(f"  {site:>15s} | {raw_std:>8.4f} | {norm_std:>8.4f} | {reduction:>+8.1f}%")
+
+# --- Step 3: Build flat curves on normalized OO ratios ---
+print("\n--- Step 3: Building flat curves on LT-normalized OO ratios ---")
+oo_flat_norm = build_flat_curves(train, 'oo_ratio_norm', start='2023-01-01')
+print(f"  OO normalized flat curves: {len(oo_flat_norm)}")
+
+# --- Step 4: Apply curves ---
+print("\n--- Step 4: Applying curves ---")
+
+# V8d baseline
+apply_flat_curves(train, oo_flat_raw, cov_flat, bias_flat)
+apply_flat_curves(test, oo_flat_raw, cov_flat, bias_flat)
+
+# V8h LT-normalized
+apply_v8h_curves(train, oo_flat_norm, cov_flat, bias_flat, elasticities)
+apply_v8h_curves(test, oo_flat_norm, cov_flat, bias_flat, elasticities)
+
+
+# ============================================================
+# SIGNAL QUALITY: V8d flat vs V8h LT-normalized
+# ============================================================
+
 print(f"\n\n{'='*100}")
-print("FULL MODEL: V8d (flat) vs V8g (conditioned)")
+print("SIGNAL QUALITY: OO flat vs OO LT-normalized")
+print("=" * 100)
+
+print(f"\n  {'Signal':>25s} | {'WMAPE':>7s} | {'Bias':>7s} | {'R²':>6s}")
+print("  " + "-" * 55)
+for label, col in [('OO flat (V8d)', 'oo_implied_flat'), ('OO LT-norm (V8h)', 'oo_implied_v8h'),
+                    ('FC flat (shared)', 'fc_implied_flat'), ('FC flat (V8h)', 'fc_implied_v8h')]:
+    v = test[test[col].notna() & (test[col]>0) & (test['Actual_Sales']>0) & test['gsa_site'].isin(clean_sites)]
+    if len(v) == 0:
+        continue
+    y, p = v['Actual_Sales'].values, v[col].values
+    w = np.sum(np.abs(y-p))/np.sum(y)*100
+    b = np.mean((p-y)/y)*100
+    r2 = 1 - np.sum((y-p)**2)/np.sum((y-np.mean(y))**2)
+    print(f"  {label:>25s} | {w:>5.1f}% | {b:>+5.1f}% | {r2:>.3f}")
+
+# Per-site OO signal quality
+print(f"\n  OO implied per-site:")
+print(f"  {'Site':>15s} | {'V8d flat':>12s} | {'V8h LT-norm':>12s} | {'Delta':>8s}")
+print("  " + "-" * 55)
+for gs in top_sites:
+    site = gs.split('|')[1]
+    fw, fb, cw, cb = 0, 0, 0, 0
+    for col, lbl in [('oo_implied_flat', 'flat'), ('oo_implied_v8h', 'v8h')]:
+        v = test[(test['gsa_site']==gs) & test[col].notna() & (test[col]>0) & (test['Actual_Sales']>0)]
+        if len(v) > 0:
+            w = np.sum(np.abs(v['Actual_Sales']-v[col]))/np.sum(v['Actual_Sales'])*100
+            b = np.mean((v[col]-v['Actual_Sales'])/v['Actual_Sales'])*100
+            if lbl == 'flat': fw, fb = w, b
+            else: cw, cb = w, b
+    print(f"  {site:>15s} | {fw:>5.1f}%{fb:>+5.0f}% | {cw:>5.1f}%{cb:>+5.0f}% | {cw-fw:>+5.1f}pp")
+
+
+# ============================================================
+# FULL MODEL: V8d vs V8h
+# ============================================================
+
+print(f"\n\n{'='*100}")
+print("FULL MODEL: V8d (flat) vs V8h (LT-normalized)")
 print("=" * 100)
 
 # V8d baseline
 print("\n  Running V8d (flat curves)...")
 test['v8d'] = weighted_avg(test, train, test_months, 'oo_implied_flat', 'fc_implied_flat')
 
-# V8g conditioned
-print("  Running V8g (conditioned curves)...")
-test['v8g'] = weighted_avg(test, train, test_months, 'oo_implied', 'fc_implied')
+# V8h LT-normalized
+print("  Running V8h (LT-normalized OO + flat FC)...")
+test['v8h'] = weighted_avg(test, train, test_months, 'oo_implied_v8h', 'fc_implied_v8h')
 
 m2 = test['Reference_Month'] > test_months[0]
 
 print(f"\n  {'Model':>15s} | {'WMAPE':>7s} | {'Bias':>7s} | {'R²':>6s} | {'Acct':>6s}")
 print("  " + "-" * 50)
-for label, col in [('V8d (flat)', 'v8d'), ('V8g (cond)', 'v8g')]:
+for label, col in [('V8d (flat)', 'v8d'), ('V8h (LT-norm)', 'v8h')]:
     ts = test[m2 & test[col].notna() & test['gsa_site'].isin(clean_sites)]
     y, p = ts['Actual_Sales'].values, ts[col].values
     w = np.sum(np.abs(y-p))/np.sum(y)*100
@@ -392,43 +462,43 @@ for label, col in [('V8d (flat)', 'v8d'), ('V8g (cond)', 'v8g')]:
 
 # Per-site
 print(f"\n  Per-site (months 2+):")
-print(f"  {'Site':>20s} | {'V8d':>12s} | {'V8g':>12s} | {'Delta':>8s}")
+print(f"  {'Site':>20s} | {'V8d':>12s} | {'V8h':>12s} | {'Delta':>8s}")
 print("  " + "-" * 60)
 for gs in sorted(clean_sites):
     site = gs.split('|')[1]
     sub = test[m2 & (test['gsa_site']==gs) & (test['Actual_Sales']>0)]
     bv = sub[sub['v8d'].notna()]
-    cv = sub[sub['v8g'].notna()]
+    cv = sub[sub['v8h'].notna()]
     if len(bv)>0 and len(cv)>0:
         bw = np.sum(np.abs(bv['Actual_Sales']-bv['v8d']))/np.sum(bv['Actual_Sales'])*100
-        cw = np.sum(np.abs(cv['Actual_Sales']-cv['v8g']))/np.sum(cv['Actual_Sales'])*100
+        cw = np.sum(np.abs(cv['Actual_Sales']-cv['v8h']))/np.sum(cv['Actual_Sales'])*100
         bb = np.mean((bv['v8d']-bv['Actual_Sales'])/bv['Actual_Sales'])*100
-        cb = np.mean((cv['v8g']-cv['Actual_Sales'])/cv['Actual_Sales'])*100
+        cb = np.mean((cv['v8h']-cv['Actual_Sales'])/cv['Actual_Sales'])*100
         print(f"  {site:>20s} | {bw:>5.1f}%{bb:>+5.0f}% | {cw:>5.1f}%{cb:>+5.0f}% | {cw-bw:>+5.1f}pp")
 
 # Per-lag
 print(f"\n  WMAPE by lag:")
-print(f"  {'Lag':>4s} | {'V8d':>8s} | {'V8g':>8s} | {'Delta':>8s}")
+print(f"  {'Lag':>4s} | {'V8d':>8s} | {'V8h':>8s} | {'Delta':>8s}")
 print("  " + "-" * 35)
 for lag in sorted(test['Prediction_Lag'].unique()):
     sub = test[m2 & (test['Prediction_Lag']==lag) & (test['Actual_Sales']>0) & test['gsa_site'].isin(clean_sites)]
     bv = sub[sub['v8d'].notna()]
-    cv = sub[sub['v8g'].notna()]
-    if len(bv)>0:
+    cv = sub[sub['v8h'].notna()]
+    if len(bv)>0 and len(cv)>0:
         bw = np.sum(np.abs(bv['Actual_Sales']-bv['v8d']))/np.sum(bv['Actual_Sales'])*100
-        cw = np.sum(np.abs(cv['Actual_Sales']-cv['v8g']))/np.sum(cv['Actual_Sales'])*100
+        cw = np.sum(np.abs(cv['Actual_Sales']-cv['v8h']))/np.sum(cv['Actual_Sales'])*100
         print(f"  {lag:>4d} | {bw:>6.1f}% | {cw:>6.1f}% | {cw-bw:>+6.1f}pp")
 
 # Account monthly
 print(f"\n  Account TF=12/L=1:")
-print(f"  {'Month':>12s} | {'Actual':>8s} | {'V8d':>15s} | {'V8g':>15s}")
+print(f"  {'Month':>12s} | {'Actual':>8s} | {'V8d':>15s} | {'V8h':>15s}")
 print("  " + "-" * 60)
 for ref in test_months[:7]:
     sub = test[(test['Reference_Month']==ref) & (test['Timeframe']==12) &
                 (test['Prediction_Lag']==1) & test['gsa_site'].isin(clean_sites)]
     act = sub['Actual_Sales'].sum()
     bp = sub['v8d'].sum()
-    cp = sub['v8g'].sum()
+    cp = sub['v8h'].sum()
     if act > 0:
         print(f"  {ref.date()} | ${act/1e6:>5.0f}M | ${bp/1e6:>5.0f}M ({(bp-act)/act*100:>+5.1f}%) | ${cp/1e6:>5.0f}M ({(cp-act)/act*100:>+5.1f}%)")
 
