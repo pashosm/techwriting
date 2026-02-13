@@ -474,6 +474,54 @@ for p in P_VALUES:
     apply_progress_correction(test, oo_flat, cov_flat, bias_flat, ref_lt_oe,
                               power=p, oo_out_col=oo_col, fc_out_col=fc_col)
 
+# Build FC debiasing curves: learn correction factor per (site, tf, lag) from training
+# fc_debias[(gs,tf,lag)] = recency-weighted mean of (Actual_Sales / fc_implied_flat)
+# At prediction: fc_implied_debiased = fc_implied_flat * fc_debias_factor
+print("  Building FC debiasing curves...")
+fc_debias = {}
+for (gs, tf, lag), grp in train.groupby(['gsa_site', 'Timeframe', 'Prediction_Lag']):
+    v = grp[grp['fc_implied_flat'].notna() & (grp['fc_implied_flat'] > 0) & (grp['Actual_Sales'] > 0)].copy()
+    if len(v) >= MIN_OBS_FLAT:
+        ratio = v['Actual_Sales'].values / v['fc_implied_flat'].values
+        mask = (ratio > 0.1) & (ratio < 10)
+        if mask.sum() >= MIN_OBS_FLAT:
+            v_m = v.iloc[mask]
+            days = (v_m['Reference_Month'] - v_m['Reference_Month'].min()).dt.days / 365
+            wts = (1 + days.values) ** RECENCY_POWER
+            fc_debias[(gs, tf, lag)] = np.average(ratio[mask], weights=wts)
+
+# Fallback: pooled across TFs
+for (gs, lag), grp in train.groupby(['gsa_site', 'Prediction_Lag']):
+    v = grp[grp['fc_implied_flat'].notna() & (grp['fc_implied_flat'] > 0) & (grp['Actual_Sales'] > 0)].copy()
+    if len(v) >= MIN_OBS_FLAT:
+        ratio = v['Actual_Sales'].values / v['fc_implied_flat'].values
+        mask = (ratio > 0.1) & (ratio < 10)
+        if mask.sum() >= MIN_OBS_FLAT:
+            v_m = v.iloc[mask]
+            days = (v_m['Reference_Month'] - v_m['Reference_Month'].min()).dt.days / 365
+            wts = (1 + days.values) ** RECENCY_POWER
+            fc_debias[('FB', gs, lag)] = np.average(ratio[mask], weights=wts)
+
+print(f"  FC debias curves: {len(fc_debias)} ({sum(1 for k in fc_debias if k[0]!='FB')} cell + {sum(1 for k in fc_debias if k[0]=='FB')} fallback)")
+
+# Apply debiased FC to train and test
+for ds in [train, test]:
+    fc_db = np.full(len(ds), np.nan)
+    for i, (idx, row) in enumerate(ds.iterrows()):
+        gs, tf, lag = row['gsa_site'], row['Timeframe'], row['Prediction_Lag']
+        fc_val = row['fc_implied_flat']
+        if np.isnan(fc_val) or fc_val <= 0:
+            continue
+        for key in [(gs, tf, lag), ('FB', gs, lag)]:
+            if key in fc_debias:
+                fc_db[i] = fc_val * fc_debias[key]
+                break
+    ds['fc_implied_debiased'] = np.maximum(fc_db, 0)
+
+# Also create a NaN OO column for FC-only models
+for ds in [train, test]:
+    ds['oo_none'] = np.nan
+
 # ============================================================
 # SIGNAL QUALITY: Conditioned vs Flat
 # ============================================================
@@ -484,7 +532,8 @@ print("=" * 100)
 print(f"\n  {'Signal':>25s} | {'WMAPE':>7s} | {'Bias':>7s} | {'R²':>6s}")
 print("  " + "-" * 55)
 for label, col in [('OO flat', 'oo_implied_flat'), ('OO conditioned', 'oo_implied'),
-                    ('FC flat', 'fc_implied_flat'), ('FC conditioned', 'fc_implied')]:
+                    ('FC flat', 'fc_implied_flat'), ('FC conditioned', 'fc_implied'),
+                    ('FC debiased', 'fc_implied_debiased')]:
     v = test[test[col].notna() & (test[col]>0) & (test['Actual_Sales']>0) & test['gsa_site'].isin(clean_sites)]
     y, p = v['Actual_Sales'].values, v[col].values
     w = np.sum(np.abs(y-p))/np.sum(y)*100
@@ -979,6 +1028,14 @@ print("=" * 100)
 print("\n  Running V8d (flat curves)...")
 test['v8d'] = weighted_avg(test, train, test_months, 'oo_implied_flat', 'fc_implied_flat')
 
+# FC-only (no OO signal)
+print("  Running FC-only...")
+test['fc_only'] = weighted_avg(test, train, test_months, 'oo_none', 'fc_implied_flat')
+
+# FC-only debiased
+print("  Running FC-only debiased...")
+test['fc_debiased'] = weighted_avg(test, train, test_months, 'oo_none', 'fc_implied_debiased')
+
 # V8g conditioned
 print("  Running V8g (conditioned curves)...")
 test['v8g'] = weighted_avg(test, train, test_months, 'oo_implied', 'fc_implied')
@@ -1025,6 +1082,19 @@ by_m['pr'] = tf12.groupby('Reference_Month').apply(lambda g: test.loc[g.index, '
 aw = np.sum(np.abs(by_m['Actual_Sales']-by_m['pr']))/np.sum(by_m['Actual_Sales'])*100
 print(f"  {'V8d (flat, p=0)':>20s} | {w:>5.1f}% | {b:>+5.1f}% | {r2:>.3f} | {aw:>4.1f}%")
 
+# FC-only and FC-debiased
+for label, col in [('FC-only', 'fc_only'), ('FC-only debiased', 'fc_debiased')]:
+    ts = test[m2 & test[col].notna() & test['gsa_site'].isin(clean_sites)]
+    y, p = ts['Actual_Sales'].values, ts[col].values
+    w = np.sum(np.abs(y-p))/np.sum(y)*100
+    b = np.mean((p-y)/y)*100
+    r2 = 1 - np.sum((y-p)**2)/np.sum((y-np.mean(y))**2)
+    tf12 = ts[(ts['Timeframe']==12)&(ts['Prediction_Lag']==1)]
+    by_m = tf12.groupby('Reference_Month').agg({'Actual_Sales':'sum'})
+    by_m['pr'] = tf12.groupby('Reference_Month').apply(lambda g: test.loc[g.index, col].sum()).values
+    aw = np.sum(np.abs(by_m['Actual_Sales']-by_m['pr']))/np.sum(by_m['Actual_Sales'])*100
+    print(f"  {label:>20s} | {w:>5.1f}% | {b:>+5.1f}% | {r2:>.3f} | {aw:>4.1f}%")
+
 for pv in P_VALUES:
     for suffix, label_sfx in [('', ''), ('_vis', '+vis')]:
         col = f'v8_p{int(pv*10)}{suffix}'
@@ -1040,38 +1110,35 @@ for pv in P_VALUES:
         aw = np.sum(np.abs(by_m['Actual_Sales']-by_m['pr']))/np.sum(by_m['Actual_Sales'])*100
         print(f"  {label:>20s} | {w:>5.1f}% | {b:>+5.1f}% | {r2:>.3f} | {aw:>4.1f}%")
 
-# Per-site for best candidates (V8d vs p=0.3 vs p=0.3+vis)
-best_p = 0.3
-best_col = f'v8_p{int(best_p*10)}'
-best_vis_col = f'v8_p{int(best_p*10)}_vis'
-print(f"\n  Per-site (months 2+) — V8d vs p={best_p} vs p={best_p}+vis:")
-print(f"  {'Site':>20s} | {'V8d':>12s} | {'p='+str(best_p):>12s} | {'p='+str(best_p)+'+vis':>12s} | {'d-p':>6s} | {'d-pv':>6s}")
+# Per-site: V8d vs FC-only vs FC-debiased
+print(f"\n  Per-site (months 2+) — V8d vs FC-only vs FC-debiased:")
+print(f"  {'Site':>20s} | {'V8d':>12s} | {'FC-only':>12s} | {'FC-debiased':>12s} | {'d-fc':>6s} | {'d-fcdb':>6s}")
 print("  " + "-" * 80)
 for gs in sorted(clean_sites):
     site = gs.split('|')[1]
     sub = test[m2 & (test['gsa_site']==gs) & (test['Actual_Sales']>0)]
     vals = {}
-    for lbl, c in [('d','v8d'),('p',best_col),('pv',best_vis_col)]:
+    for lbl, c in [('d','v8d'),('f','fc_only'),('fd','fc_debiased')]:
         v = sub[sub[c].notna()]
         if len(v) > 0:
             vals[lbl+'w'] = np.sum(np.abs(v['Actual_Sales']-v[c]))/np.sum(v['Actual_Sales'])*100
             vals[lbl+'b'] = np.mean((v[c]-v['Actual_Sales'])/v['Actual_Sales'])*100
-    if all(k in vals for k in ['dw','pw','pvw']):
-        print(f"  {site:>20s} | {vals['dw']:>5.1f}%{vals['db']:>+5.0f}% | {vals['pw']:>5.1f}%{vals['pb']:>+5.0f}% | {vals['pvw']:>5.1f}%{vals['pvb']:>+5.0f}% | {vals['pw']-vals['dw']:>+4.1f} | {vals['pvw']-vals['dw']:>+4.1f}")
+    if all(k in vals for k in ['dw','fw','fdw']):
+        print(f"  {site:>20s} | {vals['dw']:>5.1f}%{vals['db']:>+5.0f}% | {vals['fw']:>5.1f}%{vals['fb']:>+5.0f}% | {vals['fdw']:>5.1f}%{vals['fdb']:>+5.0f}% | {vals['fw']-vals['dw']:>+4.1f} | {vals['fdw']-vals['dw']:>+4.1f}")
 
-# Per-lag for best candidate
-print(f"\n  WMAPE by lag — V8d vs p={best_p} vs p={best_p}+vis:")
-print(f"  {'Lag':>4s} | {'V8d':>8s} | {'p='+str(best_p):>8s} | {'p='+str(best_p)+'+v':>8s} | {'d-p':>6s} | {'d-pv':>6s}")
+# Per-lag: V8d vs FC-only vs FC-debiased
+print(f"\n  WMAPE by lag — V8d vs FC-only vs FC-debiased:")
+print(f"  {'Lag':>4s} | {'V8d':>8s} | {'FC-only':>8s} | {'FC-deb':>8s} | {'d-fc':>6s} | {'d-fcdb':>6s}")
 print("  " + "-" * 50)
 for lag in sorted(test['Prediction_Lag'].unique()):
     sub = test[m2 & (test['Prediction_Lag']==lag) & (test['Actual_Sales']>0) & test['gsa_site'].isin(clean_sites)]
     vals = {}
-    for lbl, c in [('d','v8d'),('p',best_col),('pv',best_vis_col)]:
+    for lbl, c in [('d','v8d'),('f','fc_only'),('fd','fc_debiased')]:
         v = sub[sub[c].notna()]
         if len(v) > 0:
             vals[lbl] = np.sum(np.abs(v['Actual_Sales']-v[c]))/np.sum(v['Actual_Sales'])*100
-    if all(k in vals for k in ['d','p','pv']):
-        print(f"  {lag:>4d} | {vals['d']:>6.1f}% | {vals['p']:>6.1f}% | {vals['pv']:>6.1f}% | {vals['p']-vals['d']:>+4.1f} | {vals['pv']-vals['d']:>+4.1f}")
+    if all(k in vals for k in ['d','f','fd']):
+        print(f"  {lag:>4d} | {vals['d']:>6.1f}% | {vals['f']:>6.1f}% | {vals['fd']:>6.1f}% | {vals['f']-vals['d']:>+4.1f} | {vals['fd']-vals['d']:>+4.1f}")
 
 print(f"\n\nV7 reference: WMAPE=8.8%  bias=+0.5%  Acct=2.2%")
 print("\nDone!")
