@@ -1301,5 +1301,173 @@ for lag in sorted(df['Prediction_Lag'].unique()):
     if all(k in vals for k in ['rv','tv','rf','tf']):
         print(f"  {lag:>4d} | {vals['rv']:>7.1f}% | {vals['tv']:>7.1f}% | {vals['tv']-vals['rv']:>+4.1f} | {vals['rf']:>7.1f}% | {vals['tf']:>7.1f}% | {vals['tf']-vals['rf']:>+4.1f}")
 
+# ============================================================
+# CROSS-TIMEFRAME ANALYSIS: Can short-TF accuracy predict long-TF accuracy?
+# ============================================================
+print(f"\n\n{'='*100}")
+print("CROSS-TIMEFRAME ANALYSIS: Does TF=3 coverage/bias predict TF=12?")
+print("=" * 100)
+
+# Build pivot: for each (site, RefMonth), get fc_coverage, fc_bias, and total (=Forecast/Actual)
+# at each (TF, Lag) combination
+xtf_rows = []
+for (gs, rm), grp in df.groupby(['gsa_site', 'Reference_Month']):
+    row = {'gsa_site': gs, 'Reference_Month': rm}
+    for tf in [3, 6, 9, 12]:
+        for lag in [1, 2, 3, 4, 5, 6]:
+            sub = grp[(grp['Timeframe']==tf) & (grp['Prediction_Lag']==lag)]
+            if len(sub) == 1:
+                cov = sub['fc_coverage'].values[0]
+                bias = sub['fc_bias'].values[0]
+                if not np.isnan(cov) and not np.isnan(bias) and cov > 0:
+                    row[f'cov_tf{tf}_l{lag}'] = cov
+                    row[f'bias_tf{tf}_l{lag}'] = bias
+                    row[f'total_tf{tf}_l{lag}'] = cov * bias  # = Forecast_Value / Actual_Sales
+    xtf_rows.append(row)
+
+xtf = pd.DataFrame(xtf_rows)
+
+# ---- Analysis 1: Per-site correlation TF=3 vs TF=12 at Lag=1 ----
+print(f"\n  1. Per-site correlation: (Lag=1, TF=3) vs (Lag=1, TF=12)")
+print(f"     'total' = Forecast/Actual = coverage × bias")
+print(f"\n  {'Site':>25s} | {'N':>3s} | {'corr_cov':>8s} | {'corr_bias':>9s} | {'corr_total':>10s} | {'mean TF3':>8s} | {'mean TF12':>9s}")
+print("  " + "-" * 85)
+
+site_corrs = {}
+for gs in sorted(xtf['gsa_site'].unique()):
+    s = xtf[xtf['gsa_site']==gs].dropna(subset=['total_tf3_l1', 'total_tf12_l1'])
+    if len(s) < 5:
+        continue
+    cc = s['cov_tf3_l1'].corr(s['cov_tf12_l1'])
+    cb = s['bias_tf3_l1'].corr(s['bias_tf12_l1'])
+    ct = s['total_tf3_l1'].corr(s['total_tf12_l1'])
+    site_corrs[gs] = {'n': len(s), 'corr_cov': cc, 'corr_bias': cb, 'corr_total': ct}
+    print(f"  {gs:>25s} | {len(s):>3d} | {cc:>8.3f} | {cb:>9.3f} | {ct:>10.3f} | {s['total_tf3_l1'].mean():>8.3f} | {s['total_tf12_l1'].mean():>9.3f}")
+
+# Pooled across all sites
+s_all = xtf.dropna(subset=['total_tf3_l1', 'total_tf12_l1'])
+if len(s_all) > 5:
+    print(f"  {'ALL SITES':>25s} | {len(s_all):>3d} | {s_all['cov_tf3_l1'].corr(s_all['cov_tf12_l1']):>8.3f} | {s_all['bias_tf3_l1'].corr(s_all['bias_tf12_l1']):>9.3f} | {s_all['total_tf3_l1'].corr(s_all['total_tf12_l1']):>10.3f} | {s_all['total_tf3_l1'].mean():>8.3f} | {s_all['total_tf12_l1'].mean():>9.3f}")
+
+# ---- Analysis 2: Extend to TF=6 and TF=9 as predictors ----
+print(f"\n  2. TF=3 predicting TF=6, TF=9, TF=12 (total = Forecast/Actual, Lag=1)")
+print(f"\n  {'Site':>25s} | {'TF3→6':>7s} | {'TF3→9':>7s} | {'TF3→12':>7s} | {'TF6→12':>7s} | {'TF9→12':>7s}")
+print("  " + "-" * 70)
+
+for gs in sorted(xtf['gsa_site'].unique()):
+    s = xtf[xtf['gsa_site']==gs]
+    vals = {}
+    for src, tgt in [('tf3', 'tf6'), ('tf3', 'tf9'), ('tf3', 'tf12'), ('tf6', 'tf12'), ('tf9', 'tf12')]:
+        c1, c2 = f'total_{src}_l1', f'total_{tgt}_l1'
+        v = s.dropna(subset=[c1, c2])
+        if len(v) >= 5:
+            vals[f'{src}→{tgt}'] = v[c1].corr(v[c2])
+    if len(vals) >= 3:
+        print(f"  {gs:>25s}", end="")
+        for k in ['tf3→tf6', 'tf3→tf9', 'tf3→tf12', 'tf6→tf12', 'tf9→tf12']:
+            if k in vals:
+                print(f" | {vals[k]:>7.3f}", end="")
+            else:
+                print(f" | {'n/a':>7s}", end="")
+        print()
+
+# Pooled
+vals_all = {}
+for src, tgt in [('tf3', 'tf6'), ('tf3', 'tf9'), ('tf3', 'tf12'), ('tf6', 'tf12'), ('tf9', 'tf12')]:
+    c1, c2 = f'total_{src}_l1', f'total_{tgt}_l1'
+    v = xtf.dropna(subset=[c1, c2])
+    if len(v) >= 5:
+        vals_all[f'{src}→{tgt}'] = v[c1].corr(v[c2])
+print(f"  {'ALL SITES':>25s}", end="")
+for k in ['tf3→tf6', 'tf3→tf9', 'tf3→tf12', 'tf6→tf12', 'tf9→tf12']:
+    print(f" | {vals_all.get(k, float('nan')):>7.3f}", end="")
+print()
+
+# ---- Analysis 3: Extend to other lags ----
+print(f"\n  3. Cross-TF correlation (TF3→TF12 total) at different lags, per site")
+print(f"\n  {'Site':>25s} | {'Lag1':>6s} | {'Lag2':>6s} | {'Lag3':>6s} | {'Lag4':>6s} | {'Lag5':>6s} | {'Lag6':>6s}")
+print("  " + "-" * 70)
+
+for gs in sorted(xtf['gsa_site'].unique()):
+    s = xtf[xtf['gsa_site']==gs]
+    vals = {}
+    has_any = False
+    for lag in [1, 2, 3, 4, 5, 6]:
+        c1, c2 = f'total_tf3_l{lag}', f'total_tf12_l{lag}'
+        v = s.dropna(subset=[c1, c2])
+        if len(v) >= 5:
+            vals[lag] = v[c1].corr(v[c2])
+            has_any = True
+    if has_any:
+        print(f"  {gs:>25s}", end="")
+        for lag in [1, 2, 3, 4, 5, 6]:
+            if lag in vals:
+                print(f" | {vals[lag]:>6.3f}", end="")
+            else:
+                print(f" | {'n/a':>6s}", end="")
+        print()
+
+# ---- Analysis 4: Simple regression TF3→TF12 per site (slope, R², intercept) ----
+print(f"\n  4. Linear regression: total_TF12 = a + b * total_TF3 (Lag=1, per site)")
+print(f"     If b≈1 and a≈0, bias is the same across TFs. If b<1, TF3 bias doesn't fully carry to TF12.")
+print(f"\n  {'Site':>25s} | {'N':>3s} | {'slope':>6s} | {'intcpt':>6s} | {'R²':>5s} | {'mean_TF3':>8s} | {'mean_TF12':>9s} | {'std_TF3':>7s} | {'std_TF12':>8s}")
+print("  " + "-" * 100)
+
+for gs in sorted(xtf['gsa_site'].unique()):
+    s = xtf[xtf['gsa_site']==gs].dropna(subset=['total_tf3_l1', 'total_tf12_l1'])
+    if len(s) < 5:
+        continue
+    x = s['total_tf3_l1'].values
+    y = s['total_tf12_l1'].values
+    # Simple OLS
+    X = np.column_stack([np.ones(len(x)), x])
+    coef, _, _, _ = lstsq(X, y, rcond=None)
+    pred = X @ coef
+    ss_res = np.sum((y - pred)**2)
+    ss_tot = np.sum((y - np.mean(y))**2)
+    r2 = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+    print(f"  {gs:>25s} | {len(s):>3d} | {coef[1]:>6.3f} | {coef[0]:>6.3f} | {r2:>5.3f} | {np.mean(x):>8.3f} | {np.mean(y):>9.3f} | {np.std(x):>7.3f} | {np.std(y):>8.3f}")
+
+# ---- Analysis 5: Temporal stability — does the relationship hold in recent data? ----
+print(f"\n  5. Temporal stability: TF3→TF12 correlation in first half vs second half of data (Lag=1)")
+mid = xtf['Reference_Month'].quantile(0.5)
+print(f"     Split at {mid}")
+print(f"\n  {'Site':>25s} | {'corr_1H':>7s} | {'corr_2H':>7s} | {'N_1H':>4s} | {'N_2H':>4s}")
+print("  " + "-" * 60)
+
+for gs in sorted(xtf['gsa_site'].unique()):
+    s = xtf[xtf['gsa_site']==gs].dropna(subset=['total_tf3_l1', 'total_tf12_l1'])
+    s1 = s[s['Reference_Month'] <= mid]
+    s2 = s[s['Reference_Month'] > mid]
+    if len(s1) >= 4 and len(s2) >= 4:
+        c1 = s1['total_tf3_l1'].corr(s1['total_tf12_l1'])
+        c2 = s2['total_tf3_l1'].corr(s2['total_tf12_l1'])
+        print(f"  {gs:>25s} | {c1:>7.3f} | {c2:>7.3f} | {len(s1):>4d} | {len(s2):>4d}")
+
+# ---- Analysis 6: Coverage and bias decomposition ----
+print(f"\n  6. Decomposition: which component drives the cross-TF signal? (Lag=1)")
+print(f"     If coverage is high-corr but bias is low-corr → OO-based coverage is the signal")
+print(f"     If bias is high-corr but coverage is low-corr → systematic forecast optimism/pessimism is the signal")
+print(f"\n  {'Site':>25s} | {'cov 3→12':>9s} | {'bias 3→12':>10s} | {'total 3→12':>11s} | {'cov share':>9s}")
+print("  " + "-" * 80)
+
+for gs in sorted(xtf['gsa_site'].unique()):
+    s = xtf[xtf['gsa_site']==gs].dropna(subset=['total_tf3_l1', 'total_tf12_l1', 'cov_tf3_l1', 'cov_tf12_l1', 'bias_tf3_l1', 'bias_tf12_l1'])
+    if len(s) < 5:
+        continue
+    cc = s['cov_tf3_l1'].corr(s['cov_tf12_l1'])
+    cb = s['bias_tf3_l1'].corr(s['bias_tf12_l1'])
+    ct = s['total_tf3_l1'].corr(s['total_tf12_l1'])
+    # Coverage share: what fraction of TF12 variance can be explained by TF3 coverage alone?
+    x_cov = s['cov_tf3_l1'].values
+    y = s['total_tf12_l1'].values
+    X = np.column_stack([np.ones(len(x_cov)), x_cov])
+    coef, _, _, _ = lstsq(X, y, rcond=None)
+    pred = X @ coef
+    ss_res = np.sum((y - pred)**2)
+    ss_tot = np.sum((y - np.mean(y))**2)
+    r2_cov = 1 - ss_res / ss_tot if ss_tot > 0 else 0
+    print(f"  {gs:>25s} | {cc:>9.3f} | {cb:>10.3f} | {ct:>11.3f} | {r2_cov:>9.3f}")
+
 print(f"\n\nV7 reference: WMAPE=8.8%  bias=+0.5%  Acct=2.2%")
 print("\nDone!")
