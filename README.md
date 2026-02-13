@@ -59,6 +59,40 @@ This explains why LT changes break flat curves: V8d's flat curves key only on la
 - Helps Sites D (-3.1pp), Americas (-3.7pp), J (-0.2pp), W (flat)
 - Still hurts Sites S (+4.2pp) and T (+8.5pp) where LT+OE drops were largest
 
+## Random CV Diagnostic: Drift vs Noise
+
+To test whether the OO and FC signals are stationary (i.e., can be treated as random events), we ran **5-fold random cross-validation** alongside the standard temporal train/test split. In random CV, rows are shuffled randomly across all time periods — both train and test contain data from every month. This destroys temporal structure and reveals whether a model depends on time-stability of its signal.
+
+### Results
+
+| Model | Random CV (5-fold mean ± std) | Temporal Split | Gap |
+|-------|-------------------------------|---------------|-----|
+| V8d (OO+FC) | 94.9% ± 3.3% (bias +55%) | 16.5% | **-78pp** |
+| FC-only | 19.9% ± 0.4% (bias +21%) | 21.3% | +1.4pp |
+| FC-debiased | 21.0% ± 0.5% (bias +28%) | 25.1% | +4.1pp |
+
+Per-lag detail (fold 1 vs temporal):
+
+| Lag | Rand V8d | Temp V8d | Rand FC | Temp FC |
+|-----|----------|----------|---------|---------|
+| 1 | 38% | 11% | 16% | 16% |
+| 3 | 51% | 15% | 20% | 19% |
+| 6 | 94% | 19% | 21% | 25% |
+| 9 | 101% | 26% | 20% | 31% |
+| 12 | 285% | 34% | 28% | 36% |
+
+### Interpretation
+
+**OO is deeply non-stationary.** V8d explodes from 16.5% to 95% under random CV. When you build OO curves from a mix of all time periods and apply them to randomly sampled rows, the signal is catastrophically wrong at every lag. The OO-to-sales relationship changes so dramatically over time that a time-averaged curve is wrong for every individual period. The +55% systematic bias means OO_implied massively overstates actual sales on average.
+
+**FC is nearly stationary.** FC-only barely moves (21.3% → 19.9%, slightly *better* under random CV). This confirms FC's relationship to actuals is stable over time — it genuinely can be treated as approximately random. The slight improvement comes from having more diverse training data and no train→test distribution shift.
+
+**FC debiasing works when there's no drift.** FC-debiased improves from 25.1% (temporal) to 21.0% (random). With random sampling there's no systematic difference between train and test distributions, so the correction factors are valid. In the temporal split, FC's bias subtly shifted between train and test periods, making the historical correction factors wrong — hence debiasing backfired.
+
+### Key takeaway
+
+The V8d model's 16.5% WMAPE in temporal evaluation is **almost entirely carried by FC**. OO adds value only because the temporal split happens to keep curve drift manageable (a few months of extrapolation from recent training data). In a setting that strips away this temporal crutch, OO has *negative* value — it makes everything dramatically worse. This fundamentally changes the modeling strategy: **FC should be the primary signal, with OO used carefully (if at all) and with temporal safeguards.**
+
 ## Current Understanding & Open Questions
 
 ### Why V8k over-corrects for Sites S and T
@@ -76,6 +110,7 @@ The progress model assumes orders are **uniformly distributed** across the order
 ### Ideas to explore
 1. **Non-uniform ordering CDF**: Orders concentrate at the beginning of the window. A different CDF shape (e.g. beta distribution, or empirically estimated) could moderate the correction for lags near the boundary.
 2. **LT+OE affecting OO vs FC weighting**: Rather than correcting the OO curve itself, use the LT+OE shift to adjust how much weight we give OO vs FC in the final combination. When LT+OE drops significantly, the OO signal becomes less reliable at higher lags — the model should lean more on FC.
+3. **FC-primary architecture**: Given the random CV findings, explore models where FC is the dominant signal. OO could play a supporting role — e.g., used only at short lags (1–3) where its temporal drift is smallest, or used as a secondary input whose weight decays with OO-ratio instability.
 
 ## V7 Reference
 WMAPE = 8.8%, bias = +0.5%, account = 2.2%
