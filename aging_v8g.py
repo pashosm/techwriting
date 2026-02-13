@@ -616,7 +616,8 @@ for gs in top_sites:
 # ============================================================
 # WEIGHTED AVERAGE COMBINATION
 # ============================================================
-def weighted_avg(test_df, train_df, test_months, oo_col='oo_implied', fc_col='fc_implied'):
+def weighted_avg(test_df, train_df, test_months, oo_col='oo_implied', fc_col='fc_implied',
+                 visibility_adj=False, ref_ltoe=None):
     results = test_df.copy()
     results['pred'] = np.nan
     hist = {}
@@ -627,7 +628,7 @@ def weighted_avg(test_df, train_df, test_months, oo_col='oo_implied', fc_col='fc
                 d = (sub['Reference_Month']-sub['Reference_Month'].min()).dt.days/365
                 w = (1+d.values)**RECENCY_POWER
                 hist[(gs,tf)] = np.average(sub['Actual_Sales'], weights=w)
-    
+
     for mi, month in enumerate(test_months):
         if mi==0:
             prior = train_df[train_df['Reference_Month'] >= train_df['Reference_Month'].quantile(0.8)]
@@ -641,7 +642,7 @@ def weighted_avg(test_df, train_df, test_months, oo_col='oo_implied', fc_col='fc
                 oo_mape = np.mean(np.abs(oo_v[oo_col]-oo_v['Actual_Sales'])/oo_v['Actual_Sales']) if len(oo_v)>=1 else 1.0
                 fc_v = ps[ps[fc_col].notna()&(ps[fc_col]>0)]
                 fc_mape = np.mean(np.abs(fc_v[fc_col]-fc_v['Actual_Sales'])/fc_v['Actual_Sales']) if len(fc_v)>=1 else 1.0
-                
+
                 rmask = cmask&(results['gsa_site']==gs)&(results['Timeframe']==tf)
                 for idx in results[rmask].index:
                     row = results.loc[idx]
@@ -650,6 +651,22 @@ def weighted_avg(test_df, train_df, test_months, oo_col='oo_implied', fc_col='fc
                     has_fc = not np.isnan(row[fc_col]) and row[fc_col]>0
                     oo_f = max(0.3, 1.0-0.06*(lag-1)) if has_oo else 0
                     fc_f = max(0.3, 1.0-0.06*(lag-1)) if has_fc else 0
+
+                    # Visibility adjustment: down-weight OO when LT+OE has dropped
+                    if visibility_adj and ref_ltoe is not None and has_oo:
+                        lt_oe_cur = row['Avg_Weighted_Lead_Time'] + row['Avg_Weighted_Order_Earliness']
+                        ref = None
+                        for key in [(gs, tf, lag), ('FB', gs, lag)]:
+                            if key in ref_ltoe:
+                                ref = ref_ltoe[key]; break
+                        if ref is not None and ref > 0.5 and lt_oe_cur > 0.5:
+                            prog_ref = max(0.05, 1.0 - lag / ref)
+                            prog_cur = max(0.05, 1.0 - lag / lt_oe_cur)
+                            visibility = np.clip(prog_cur / prog_ref, 0.1, 1.0)
+                        else:
+                            visibility = 1.0
+                        oo_f = oo_f * visibility
+
                     w_oo = (1/max(oo_mape,0.01))*oo_f if has_oo else 0
                     w_fc = (1/max(fc_mape,0.01))*fc_f if has_fc else 0
                     hv = hist.get((gs,tf), 0)
@@ -688,11 +705,22 @@ test['v8j'] = weighted_avg(test, train, test_months, 'oo_implied_elag', 'fc_impl
 print("  Running V8k (progress-corrected OO + flat FC)...")
 test['v8k'] = weighted_avg(test, train, test_months, 'oo_implied_prog', 'fc_implied_prog')
 
+# V8l: flat curves + visibility-adjusted weighting
+print("  Running V8l (flat curves + visibility weighting)...")
+test['v8l'] = weighted_avg(test, train, test_months, 'oo_implied_flat', 'fc_implied_flat',
+                           visibility_adj=True, ref_ltoe=ref_lt_oe)
+
+# V8m: progress-corrected curves + visibility-adjusted weighting
+print("  Running V8m (prog-corrected + visibility weighting)...")
+test['v8m'] = weighted_avg(test, train, test_months, 'oo_implied_prog', 'fc_implied_prog',
+                           visibility_adj=True, ref_ltoe=ref_lt_oe)
+
 m2 = test['Reference_Month'] > test_months[0]
 
-print(f"\n  {'Model':>15s} | {'WMAPE':>7s} | {'Bias':>7s} | {'R²':>6s} | {'Acct':>6s}")
-print("  " + "-" * 55)
-for label, col in [('V8d (flat)', 'v8d'), ('V8g (cond)', 'v8g'), ('V8i (LT-norm)', 'v8i'), ('V8j (eff-lag)', 'v8j'), ('V8k (prog)', 'v8k')]:
+print(f"\n  {'Model':>20s} | {'WMAPE':>7s} | {'Bias':>7s} | {'R²':>6s} | {'Acct':>6s}")
+print("  " + "-" * 60)
+for label, col in [('V8d (flat)', 'v8d'), ('V8k (prog)', 'v8k'),
+                    ('V8l (flat+vis)', 'v8l'), ('V8m (prog+vis)', 'v8m')]:
     ts = test[m2 & test[col].notna() & test['gsa_site'].isin(clean_sites)]
     y, p = ts['Actual_Sales'].values, ts[col].values
     w = np.sum(np.abs(y-p))/np.sum(y)*100
@@ -702,54 +730,51 @@ for label, col in [('V8d (flat)', 'v8d'), ('V8g (cond)', 'v8g'), ('V8i (LT-norm)
     by_m = tf12.groupby('Reference_Month').agg({'Actual_Sales':'sum'})
     by_m['pr'] = tf12.groupby('Reference_Month').apply(lambda g: test.loc[g.index, col].sum()).values
     aw = np.sum(np.abs(by_m['Actual_Sales']-by_m['pr']))/np.sum(by_m['Actual_Sales'])*100
-    print(f"  {label:>15s} | {w:>5.1f}% | {b:>+5.1f}% | {r2:>.3f} | {aw:>4.1f}%")
+    print(f"  {label:>20s} | {w:>5.1f}% | {b:>+5.1f}% | {r2:>.3f} | {aw:>4.1f}%")
 
 # Per-site
 print(f"\n  Per-site (months 2+):")
-print(f"  {'Site':>20s} | {'V8d':>12s} | {'V8j':>12s} | {'V8k':>12s} | {'d-k':>8s}")
-print("  " + "-" * 75)
+print(f"  {'Site':>20s} | {'V8d':>12s} | {'V8k':>12s} | {'V8l':>12s} | {'V8m':>12s} | {'d-l':>6s} | {'d-m':>6s}")
+print("  " + "-" * 95)
 for gs in sorted(clean_sites):
     site = gs.split('|')[1]
     sub = test[m2 & (test['gsa_site']==gs) & (test['Actual_Sales']>0)]
-    bv = sub[sub['v8d'].notna()]
-    jv = sub[sub['v8j'].notna()]
-    kv = sub[sub['v8k'].notna()]
-    if len(bv)>0 and len(jv)>0 and len(kv)>0:
-        bw = np.sum(np.abs(bv['Actual_Sales']-bv['v8d']))/np.sum(bv['Actual_Sales'])*100
-        jw = np.sum(np.abs(jv['Actual_Sales']-jv['v8j']))/np.sum(jv['Actual_Sales'])*100
-        kw = np.sum(np.abs(kv['Actual_Sales']-kv['v8k']))/np.sum(kv['Actual_Sales'])*100
-        bb = np.mean((bv['v8d']-bv['Actual_Sales'])/bv['Actual_Sales'])*100
-        jb = np.mean((jv['v8j']-jv['Actual_Sales'])/jv['Actual_Sales'])*100
-        kb = np.mean((kv['v8k']-kv['Actual_Sales'])/kv['Actual_Sales'])*100
-        print(f"  {site:>20s} | {bw:>5.1f}%{bb:>+5.0f}% | {jw:>5.1f}%{jb:>+5.0f}% | {kw:>5.1f}%{kb:>+5.0f}% | {kw-bw:>+5.1f}pp")
+    vals = {}
+    for lbl, c in [('d','v8d'),('k','v8k'),('l','v8l'),('m','v8m')]:
+        v = sub[sub[c].notna()]
+        if len(v) > 0:
+            vals[lbl+'w'] = np.sum(np.abs(v['Actual_Sales']-v[c]))/np.sum(v['Actual_Sales'])*100
+            vals[lbl+'b'] = np.mean((v[c]-v['Actual_Sales'])/v['Actual_Sales'])*100
+    if all(k in vals for k in ['dw','kw','lw','mw']):
+        print(f"  {site:>20s} | {vals['dw']:>5.1f}%{vals['db']:>+5.0f}% | {vals['kw']:>5.1f}%{vals['kb']:>+5.0f}% | {vals['lw']:>5.1f}%{vals['lb']:>+5.0f}% | {vals['mw']:>5.1f}%{vals['mb']:>+5.0f}% | {vals['lw']-vals['dw']:>+4.1f} | {vals['mw']-vals['dw']:>+4.1f}")
 
 # Per-lag
 print(f"\n  WMAPE by lag:")
-print(f"  {'Lag':>4s} | {'V8d':>8s} | {'V8j':>8s} | {'V8k':>8s} | {'d-k':>8s}")
-print("  " + "-" * 45)
+print(f"  {'Lag':>4s} | {'V8d':>8s} | {'V8k':>8s} | {'V8l':>8s} | {'V8m':>8s} | {'d-l':>6s} | {'d-m':>6s}")
+print("  " + "-" * 60)
 for lag in sorted(test['Prediction_Lag'].unique()):
     sub = test[m2 & (test['Prediction_Lag']==lag) & (test['Actual_Sales']>0) & test['gsa_site'].isin(clean_sites)]
-    bv = sub[sub['v8d'].notna()]
-    jv = sub[sub['v8j'].notna()]
-    kv = sub[sub['v8k'].notna()]
-    if len(bv)>0:
-        bw = np.sum(np.abs(bv['Actual_Sales']-bv['v8d']))/np.sum(bv['Actual_Sales'])*100
-        jw = np.sum(np.abs(jv['Actual_Sales']-jv['v8j']))/np.sum(jv['Actual_Sales'])*100
-        kw = np.sum(np.abs(kv['Actual_Sales']-kv['v8k']))/np.sum(kv['Actual_Sales'])*100
-        print(f"  {lag:>4d} | {bw:>6.1f}% | {jw:>6.1f}% | {kw:>6.1f}% | {kw-bw:>+6.1f}pp")
+    vals = {}
+    for lbl, c in [('d','v8d'),('k','v8k'),('l','v8l'),('m','v8m')]:
+        v = sub[sub[c].notna()]
+        if len(v) > 0:
+            vals[lbl] = np.sum(np.abs(v['Actual_Sales']-v[c]))/np.sum(v['Actual_Sales'])*100
+    if all(k in vals for k in ['d','k','l','m']):
+        print(f"  {lag:>4d} | {vals['d']:>6.1f}% | {vals['k']:>6.1f}% | {vals['l']:>6.1f}% | {vals['m']:>6.1f}% | {vals['l']-vals['d']:>+4.1f} | {vals['m']-vals['d']:>+4.1f}")
 
 # Account monthly
 print(f"\n  Account TF=12/L=1:")
-print(f"  {'Month':>12s} | {'Actual':>8s} | {'V8d':>15s} | {'V8k':>15s}")
-print("  " + "-" * 65)
+print(f"  {'Month':>12s} | {'Actual':>8s} | {'V8d':>15s} | {'V8l':>15s} | {'V8m':>15s}")
+print("  " + "-" * 80)
 for ref in test_months[:7]:
     sub = test[(test['Reference_Month']==ref) & (test['Timeframe']==12) &
                 (test['Prediction_Lag']==1) & test['gsa_site'].isin(clean_sites)]
     act = sub['Actual_Sales'].sum()
     bp = sub['v8d'].sum()
-    kp = sub['v8k'].sum()
+    lp = sub['v8l'].sum()
+    mp = sub['v8m'].sum()
     if act > 0:
-        print(f"  {ref.date()} | ${act/1e6:>5.0f}M | ${bp/1e6:>5.0f}M ({(bp-act)/act*100:>+5.1f}%) | ${kp/1e6:>5.0f}M ({(kp-act)/act*100:>+5.1f}%)")
+        print(f"  {ref.date()} | ${act/1e6:>5.0f}M | ${bp/1e6:>5.0f}M ({(bp-act)/act*100:>+5.1f}%) | ${lp/1e6:>5.0f}M ({(lp-act)/act*100:>+5.1f}%) | ${mp/1e6:>5.0f}M ({(mp-act)/act*100:>+5.1f}%)")
 
 print(f"\n\nV7 reference: WMAPE=8.8%  bias=+0.5%  Acct=2.2%")
 print("\nDone!")
