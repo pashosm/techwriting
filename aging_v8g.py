@@ -1140,5 +1140,166 @@ for lag in sorted(test['Prediction_Lag'].unique()):
     if all(k in vals for k in ['d','f','fd']):
         print(f"  {lag:>4d} | {vals['d']:>6.1f}% | {vals['f']:>6.1f}% | {vals['fd']:>6.1f}% | {vals['f']-vals['d']:>+4.1f} | {vals['fd']-vals['d']:>+4.1f}")
 
+# ============================================================
+# K-FOLD RANDOM CV: Drift vs Noise Diagnostic
+# ============================================================
+N_FOLDS = 5
+np.random.seed(42)
+
+print(f"\n\n{'='*100}")
+print(f"K-FOLD RANDOM CV ({N_FOLDS} folds) — Diagnosing drift vs noise")
+print("=" * 100)
+
+# Shuffle row indices
+indices = np.arange(len(df))
+np.random.shuffle(indices)
+fold_size = len(df) // N_FOLDS
+
+fold_metrics = {model: [] for model in ['V8d', 'FC-only', 'FC-debiased']}
+
+for fold_i in range(N_FOLDS):
+    fold_start = fold_i * fold_size
+    fold_end = fold_start + fold_size if fold_i < N_FOLDS - 1 else len(df)
+    test_idx = indices[fold_start:fold_end]
+    train_idx = np.setdiff1d(indices, test_idx)
+
+    f_train = df.iloc[train_idx].copy()
+    f_test = df.iloc[test_idx].copy()
+
+    # Build flat curves from this fold's training data
+    oo_f, _ = build_conditioned_curves(f_train, 'oo_ratio', start='2023-01-01')
+    cov_f, _ = build_conditioned_curves(f_train, 'fc_coverage', start='2023-01-01')
+    bias_f, _ = build_conditioned_curves(f_train, 'fc_bias', start='2023-01-01')
+
+    # Apply flat curves
+    apply_flat_only(f_train, oo_f, cov_f, bias_f)
+    apply_flat_only(f_test, oo_f, cov_f, bias_f)
+
+    # Build FC debias curves for this fold
+    fold_fc_debias = {}
+    for (gs, tf, lag), grp in f_train.groupby(['gsa_site', 'Timeframe', 'Prediction_Lag']):
+        v = grp[grp['fc_implied_flat'].notna() & (grp['fc_implied_flat'] > 0) & (grp['Actual_Sales'] > 0)].copy()
+        if len(v) >= MIN_OBS_FLAT:
+            ratio = v['Actual_Sales'].values / v['fc_implied_flat'].values
+            mask = (ratio > 0.1) & (ratio < 10)
+            if mask.sum() >= MIN_OBS_FLAT:
+                v_m = v.iloc[mask]
+                days = (v_m['Reference_Month'] - v_m['Reference_Month'].min()).dt.days / 365
+                wts = (1 + days.values) ** RECENCY_POWER
+                fold_fc_debias[(gs, tf, lag)] = np.average(ratio[mask], weights=wts)
+    for (gs, lag), grp in f_train.groupby(['gsa_site', 'Prediction_Lag']):
+        v = grp[grp['fc_implied_flat'].notna() & (grp['fc_implied_flat'] > 0) & (grp['Actual_Sales'] > 0)].copy()
+        if len(v) >= MIN_OBS_FLAT:
+            ratio = v['Actual_Sales'].values / v['fc_implied_flat'].values
+            mask = (ratio > 0.1) & (ratio < 10)
+            if mask.sum() >= MIN_OBS_FLAT:
+                v_m = v.iloc[mask]
+                days = (v_m['Reference_Month'] - v_m['Reference_Month'].min()).dt.days / 365
+                wts = (1 + days.values) ** RECENCY_POWER
+                fold_fc_debias[('FB', gs, lag)] = np.average(ratio[mask], weights=wts)
+
+    # Apply debiased FC to both train and test
+    for ds in [f_train, f_test]:
+        fc_db = np.full(len(ds), np.nan)
+        for i, (idx, row) in enumerate(ds.iterrows()):
+            gs, tf, lag = row['gsa_site'], row['Timeframe'], row['Prediction_Lag']
+            fc_val = row['fc_implied_flat']
+            if np.isnan(fc_val) or fc_val <= 0:
+                continue
+            for key in [(gs, tf, lag), ('FB', gs, lag)]:
+                if key in fold_fc_debias:
+                    fc_db[i] = fc_val * fold_fc_debias[key]
+                    break
+        ds['fc_implied_debiased'] = np.maximum(fc_db, 0)
+        ds['oo_none'] = np.nan
+
+    # Run models
+    f_test_months = sorted(f_test['Reference_Month'].unique())
+    f_test['v8d'] = weighted_avg(f_test, f_train, f_test_months, 'oo_implied_flat', 'fc_implied_flat')
+    f_test['fc_only'] = weighted_avg(f_test, f_train, f_test_months, 'oo_none', 'fc_implied_flat')
+    f_test['fc_debiased'] = weighted_avg(f_test, f_train, f_test_months, 'oo_none', 'fc_implied_debiased')
+
+    # Compute metrics for each model (clean sites only)
+    ts = f_test[f_test['gsa_site'].isin(clean_sites) & (f_test['Actual_Sales'] > 0)]
+    for model_name, col in [('V8d', 'v8d'), ('FC-only', 'fc_only'), ('FC-debiased', 'fc_debiased')]:
+        v = ts[ts[col].notna()]
+        if len(v) > 0:
+            y, p = v['Actual_Sales'].values, v[col].values
+            wmape = np.sum(np.abs(y - p)) / np.sum(y) * 100
+            bias = np.mean((p - y) / y) * 100
+            r2 = 1 - np.sum((y - p)**2) / np.sum((y - np.mean(y))**2)
+            fold_metrics[model_name].append({'wmape': wmape, 'bias': bias, 'r2': r2})
+
+    print(f"  Fold {fold_i+1}: V8d={fold_metrics['V8d'][-1]['wmape']:.1f}%  "
+          f"FC-only={fold_metrics['FC-only'][-1]['wmape']:.1f}%  "
+          f"FC-deb={fold_metrics['FC-debiased'][-1]['wmape']:.1f}%")
+
+# Summary: Random CV vs Temporal
+print(f"\n  {'':>20s} | {'Random CV (mean±std)':>25s} | {'Temporal':>10s} | {'Gap':>6s}")
+print("  " + "-" * 70)
+
+# Get temporal metrics for comparison
+temporal_metrics = {}
+ts_temp = test[m2 & test['gsa_site'].isin(clean_sites) & (test['Actual_Sales'] > 0)]
+for model_name, col in [('V8d', 'v8d'), ('FC-only', 'fc_only'), ('FC-debiased', 'fc_debiased')]:
+    v = ts_temp[ts_temp[col].notna()]
+    if len(v) > 0:
+        y, p = v['Actual_Sales'].values, v[col].values
+        temporal_metrics[model_name] = np.sum(np.abs(y - p)) / np.sum(y) * 100
+
+for model_name in ['V8d', 'FC-only', 'FC-debiased']:
+    wmapes = [m['wmape'] for m in fold_metrics[model_name]]
+    biases = [m['bias'] for m in fold_metrics[model_name]]
+    r2s = [m['r2'] for m in fold_metrics[model_name]]
+    t_wmape = temporal_metrics.get(model_name, float('nan'))
+    gap = t_wmape - np.mean(wmapes)
+    print(f"  {model_name:>20s} | {np.mean(wmapes):>5.1f}% ± {np.std(wmapes):>4.1f}% (bias {np.mean(biases):>+5.1f}%) | {t_wmape:>6.1f}% | {gap:>+4.1f}pp")
+
+# Per-fold detail
+print(f"\n  Per-fold WMAPE:")
+print(f"  {'Fold':>6s} | {'V8d':>8s} | {'FC-only':>8s} | {'FC-deb':>8s} | {'V8d bias':>9s}")
+print("  " + "-" * 50)
+for i in range(N_FOLDS):
+    v8d_m = fold_metrics['V8d'][i]
+    fc_m = fold_metrics['FC-only'][i]
+    fcd_m = fold_metrics['FC-debiased'][i]
+    print(f"  {'F'+str(i+1):>6s} | {v8d_m['wmape']:>6.1f}% | {fc_m['wmape']:>6.1f}% | {fcd_m['wmape']:>6.1f}% | {v8d_m['bias']:>+7.1f}%")
+
+# Per-lag comparison: random CV (pooled across folds) vs temporal
+# Re-run one fold to get per-lag detail (use full random CV pool)
+print(f"\n  WMAPE by lag — Random CV (fold 1) vs Temporal:")
+# Recompute fold 1 for per-lag
+fold_start = 0
+fold_end = fold_size
+t_idx = indices[fold_start:fold_end]
+tr_idx = np.setdiff1d(indices, t_idx)
+f1_test = df.iloc[t_idx].copy()
+f1_train = df.iloc[tr_idx].copy()
+oo_f1, _ = build_conditioned_curves(f1_train, 'oo_ratio', start='2023-01-01')
+cov_f1, _ = build_conditioned_curves(f1_train, 'fc_coverage', start='2023-01-01')
+bias_f1, _ = build_conditioned_curves(f1_train, 'fc_bias', start='2023-01-01')
+apply_flat_only(f1_train, oo_f1, cov_f1, bias_f1)
+apply_flat_only(f1_test, oo_f1, cov_f1, bias_f1)
+f1_test['oo_none'] = np.nan
+f1_train['oo_none'] = np.nan
+f1_months = sorted(f1_test['Reference_Month'].unique())
+f1_test['v8d'] = weighted_avg(f1_test, f1_train, f1_months, 'oo_implied_flat', 'fc_implied_flat')
+f1_test['fc_only'] = weighted_avg(f1_test, f1_train, f1_months, 'oo_none', 'fc_implied_flat')
+
+print(f"  {'Lag':>4s} | {'Rand V8d':>9s} | {'Temp V8d':>9s} | {'gap':>6s} | {'Rand FC':>9s} | {'Temp FC':>9s} | {'gap':>6s}")
+print("  " + "-" * 65)
+for lag in sorted(df['Prediction_Lag'].unique()):
+    # Random fold 1
+    sub_r = f1_test[(f1_test['Prediction_Lag']==lag) & (f1_test['Actual_Sales']>0) & f1_test['gsa_site'].isin(clean_sites)]
+    # Temporal
+    sub_t = test[m2 & (test['Prediction_Lag']==lag) & (test['Actual_Sales']>0) & test['gsa_site'].isin(clean_sites)]
+    vals = {}
+    for lbl, sub, col in [('rv', sub_r, 'v8d'), ('tv', sub_t, 'v8d'), ('rf', sub_r, 'fc_only'), ('tf', sub_t, 'fc_only')]:
+        v = sub[sub[col].notna()]
+        if len(v) > 0:
+            vals[lbl] = np.sum(np.abs(v['Actual_Sales']-v[col]))/np.sum(v['Actual_Sales'])*100
+    if all(k in vals for k in ['rv','tv','rf','tf']):
+        print(f"  {lag:>4d} | {vals['rv']:>7.1f}% | {vals['tv']:>7.1f}% | {vals['tv']-vals['rv']:>+4.1f} | {vals['rf']:>7.1f}% | {vals['tf']:>7.1f}% | {vals['tf']-vals['rf']:>+4.1f}")
+
 print(f"\n\nV7 reference: WMAPE=8.8%  bias=+0.5%  Acct=2.2%")
 print("\nDone!")
