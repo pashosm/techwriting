@@ -23,6 +23,10 @@ LT_BANDWIDTHS = [1.0, 1.5, 2.0, 3.0, 5.0]  # Bandwidth values to sweep
 DEFAULT_LT_BW = 2.0                           # Default bandwidth
 MIN_EFF_OBS_LT = 3.0                          # Minimum effective sample size for LT-aware
 
+# OE-aware kernel parameters
+OE_BANDWIDTHS = [1.0, 2.0, 3.0, 5.0]          # OE bandwidth values to sweep
+DEFAULT_OE_BW = 3.0                             # Default OE bandwidth (conservative)
+
 df = pd.read_csv('Dummy Training Data Customer 1 Try 2 11-Feb-2026.csv',
                  parse_dates=['Reference_Month', 'Target_Period_Start', 'Target_Period_End'])
 if 'Unnamed: 0' in df.columns: df = df.drop(columns=['Unnamed: 0'])
@@ -154,9 +158,9 @@ def build_conditioned_curves(train_df, ratio_col, start=None):
 # LT-AWARE KERNEL CURVES (V8h)
 # ============================================================
 def build_lt_aware_curves(train_df, ratio_col, start=None):
-    """Store per-cell training data for LT-aware kernel weighting.
+    """Store per-cell training data for LT+OE kernel weighting.
     Returns: flat dict, lt_data dict
-    lt_data: {(gs, tf, lag): {'ratios': arr, 'lt': arr, 'recency_wts': arr}}
+    lt_data: {(gs, tf, lag): {'ratios': arr, 'lt': arr, 'oe': arr, 'recency_wts': arr}}
     """
     td = train_df if start is None else train_df[train_df['Reference_Month'] >= start]
     flat = {}
@@ -173,6 +177,7 @@ def build_lt_aware_curves(train_df, ratio_col, start=None):
         lt_data[(gs, tf, lag)] = {
             'ratios': valid[ratio_col].values,
             'lt': valid['Avg_Weighted_Lead_Time'].values,
+            'oe': valid['Avg_Weighted_Order_Earliness'].values,
             'recency_wts': wts,
         }
 
@@ -186,14 +191,16 @@ def build_lt_aware_curves(train_df, ratio_col, start=None):
             lt_data[('FB', gs, lag)] = {
                 'ratios': valid[ratio_col].values,
                 'lt': valid['Avg_Weighted_Lead_Time'].values,
+                'oe': valid['Avg_Weighted_Order_Earliness'].values,
                 'recency_wts': wts,
             }
 
     return flat, lt_data
 
-def get_lt_aware_value(lt_data, flat, gs, tf, lag, lt_current, h):
-    """Get LT-aware kernel-weighted ratio.
-    Falls back to flat if LT is missing or effective sample size is too low.
+def get_lt_aware_value(lt_data, flat, gs, tf, lag, lt_current, h,
+                       oe_current=None, h_oe=None):
+    """Get LT+OE kernel-weighted ratio.
+    Falls back: 2D (LT+OE) -> 1D (LT-only) -> flat.
     """
     if np.isnan(lt_current) or lt_current == 0:
         for key in [(gs, tf, lag), ('FB', gs, lag)]:
@@ -201,10 +208,25 @@ def get_lt_aware_value(lt_data, flat, gs, tf, lag, lt_current, h):
                 return flat[key], 'flat'
         return None, None
 
+    use_oe = (h_oe is not None and oe_current is not None
+              and not np.isnan(oe_current) and oe_current > 0)
+
     for key in [(gs, tf, lag), ('FB', gs, lag)]:
         if key in lt_data:
             d = lt_data[key]
             lt_kernel = np.exp(-((d['lt'] - lt_current) ** 2) / (2 * h * h))
+
+            # Try 2D kernel (LT + OE)
+            if use_oe:
+                oe_kernel = np.exp(-((d['oe'] - oe_current) ** 2) / (2 * h_oe * h_oe))
+                combined_2d = d['recency_wts'] * lt_kernel * oe_kernel
+                wt_sum_2d = np.sum(combined_2d)
+                if wt_sum_2d > 0:
+                    n_eff_2d = wt_sum_2d ** 2 / np.sum(combined_2d ** 2)
+                    if n_eff_2d >= MIN_EFF_OBS_LT:
+                        return np.average(d['ratios'], weights=combined_2d), 'lt_oe_aware'
+
+            # Fallback: 1D kernel (LT only)
             combined_wts = d['recency_wts'] * lt_kernel
             wt_sum = np.sum(combined_wts)
             if wt_sum > 0:
@@ -215,18 +237,20 @@ def get_lt_aware_value(lt_data, flat, gs, tf, lag, lt_current, h):
             return flat[key], 'flat'
     return None, None
 
-def apply_lt_aware(dset, lt_data, oo_flat, cov_f, bias_f, h):
-    """Apply LT-aware OO curves + flat FC curves. Returns OO type counts."""
+def apply_lt_aware(dset, lt_data, oo_flat, cov_f, bias_f, h, h_oe=None):
+    """Apply LT+OE kernel OO curves + flat FC curves. Returns OO type counts."""
     oo_impl = np.full(len(dset), np.nan)
     fc_impl = np.full(len(dset), np.nan)
-    oo_types = {'lt_aware': 0, 'flat': 0}
+    oo_types = {}
 
     for i, (idx, row) in enumerate(dset.iterrows()):
         gs, tf, lag = row['gsa_site'], row['Timeframe'], row['Prediction_Lag']
         lt = row['Avg_Weighted_Lead_Time']
+        oe = row['Avg_Weighted_Order_Earliness']
 
-        # OO: LT-aware kernel
-        f, ftype = get_lt_aware_value(lt_data, oo_flat, gs, tf, lag, lt, h)
+        # OO: LT+OE kernel (falls back to LT-only, then flat)
+        f, ftype = get_lt_aware_value(lt_data, oo_flat, gs, tf, lag, lt, h,
+                                       oe_current=oe, h_oe=h_oe)
         if f and f > 0.001:
             oo_impl[i] = row['Open_Orders'] / f
             if ftype: oo_types[ftype] = oo_types.get(ftype, 0) + 1
@@ -348,10 +372,10 @@ apply_flat_only(train, oo_flat, cov_flat, bias_flat)
 apply_flat_only(test, oo_flat, cov_flat, bias_flat)
 
 # Apply LT-aware curves (OO only, FC uses flat)
-print(f"  Applying LT-aware curves (h={DEFAULT_LT_BW:.1f})...")
-lt_types_train = apply_lt_aware(train, oo_lt_data, oo_flat_lt, cov_flat, bias_flat, DEFAULT_LT_BW)
-lt_types_test = apply_lt_aware(test, oo_lt_data, oo_flat_lt, cov_flat, bias_flat, DEFAULT_LT_BW)
-print(f"  Test OO LT-aware types: {lt_types_test}")
+print(f"  Applying LT+OE kernel (h_lt={DEFAULT_LT_BW:.1f}, h_oe={DEFAULT_OE_BW:.1f})...")
+lt_types_train = apply_lt_aware(train, oo_lt_data, oo_flat_lt, cov_flat, bias_flat, DEFAULT_LT_BW, DEFAULT_OE_BW)
+lt_types_test = apply_lt_aware(test, oo_lt_data, oo_flat_lt, cov_flat, bias_flat, DEFAULT_LT_BW, DEFAULT_OE_BW)
+print(f"  Test OO kernel types: {lt_types_test}")
 
 # ============================================================
 # SIGNAL QUALITY: Conditioned vs Flat
@@ -404,13 +428,13 @@ for gs in top_sites:
 # SIGNAL QUALITY: LT-aware OO (V8h)
 # ============================================================
 print(f"\n\n{'='*100}")
-print("SIGNAL QUALITY: OO LT-aware vs Flat vs Conditioned")
+print("SIGNAL QUALITY: OO LT+OE kernel vs Flat vs Conditioned")
 print("=" * 100)
 
 print(f"\n  {'Signal':>25s} | {'WMAPE':>7s} | {'Bias':>7s} | {'R²':>6s}")
 print("  " + "-" * 55)
 for label, col in [('OO flat', 'oo_implied_flat'), ('OO conditioned', 'oo_implied'),
-                    ('OO lt_aware', 'oo_implied_lt')]:
+                    ('OO lt+oe kernel', 'oo_implied_lt')]:
     v = test[test[col].notna() & (test[col]>0) & (test['Actual_Sales']>0) & test['gsa_site'].isin(clean_sites)]
     y, p = v['Actual_Sales'].values, v[col].values
     w = np.sum(np.abs(y-p))/np.sum(y)*100
@@ -418,8 +442,8 @@ for label, col in [('OO flat', 'oo_implied_flat'), ('OO conditioned', 'oo_implie
     r2 = 1 - np.sum((y-p)**2)/np.sum((y-np.mean(y))**2)
     print(f"  {label:>25s} | {w:>5.1f}% | {b:>+5.1f}% | {r2:>.3f}")
 
-print(f"\n  OO implied per-site (flat vs lt_aware):")
-print(f"  {'Site':>15s} | {'Flat':>12s} | {'LT-aware':>12s} | {'Delta':>8s}")
+print(f"\n  OO implied per-site (flat vs LT+OE kernel):")
+print(f"  {'Site':>15s} | {'Flat':>12s} | {'LT+OE kern':>12s} | {'Delta':>8s}")
 print("  " + "-" * 55)
 for gs in top_sites:
     site = gs.split('|')[1]
@@ -437,24 +461,58 @@ for gs in top_sites:
 # BANDWIDTH SWEEP
 # ============================================================
 print(f"\n\n{'='*100}")
-print("BANDWIDTH SWEEP: LT-aware OO signal quality by h")
+print("BANDWIDTH SWEEP: LT bandwidth (h_oe fixed at default)")
 print("=" * 100)
-print(f"\n  {'h':>5s} | {'WMAPE':>7s} | {'Bias':>7s} | {'R²':>6s} | {'%lt_aware':>10s}")
-print("  " + "-" * 50)
+print(f"\n  {'h_lt':>5s} | {'WMAPE':>7s} | {'Bias':>7s} | {'R²':>6s} | {'%lt_oe':>7s} | {'%lt':>5s} | {'%flat':>6s}")
+print("  " + "-" * 55)
 for h in LT_BANDWIDTHS:
-    types = apply_lt_aware(test, oo_lt_data, oo_flat_lt, cov_flat, bias_flat, h)
+    types = apply_lt_aware(test, oo_lt_data, oo_flat_lt, cov_flat, bias_flat, h, DEFAULT_OE_BW)
     v = test[test['oo_implied_lt'].notna() & (test['oo_implied_lt']>0) &
              (test['Actual_Sales']>0) & test['gsa_site'].isin(clean_sites)]
     y, p = v['Actual_Sales'].values, v['oo_implied_lt'].values
     wmape = np.sum(np.abs(y-p))/np.sum(y)*100
     bias = np.mean((p-y)/y)*100
     r2 = 1 - np.sum((y-p)**2)/np.sum((y-np.mean(y))**2)
-    pct_lt = types.get('lt_aware', 0) / max(sum(types.values()), 1) * 100
-    print(f"  {h:>5.1f} | {wmape:>5.1f}% | {bias:>+5.1f}% | {r2:>.3f} | {pct_lt:>5.1f}%")
+    tot = max(sum(types.values()), 1)
+    pct_2d = types.get('lt_oe_aware', 0) / tot * 100
+    pct_lt = types.get('lt_aware', 0) / tot * 100
+    pct_fl = types.get('flat', 0) / tot * 100
+    print(f"  {h:>5.1f} | {wmape:>5.1f}% | {bias:>+5.1f}% | {r2:>.3f} | {pct_2d:>5.1f}% | {pct_lt:>4.1f}% | {pct_fl:>4.1f}%")
 
-# Restore default bandwidth for V8h model run
-apply_lt_aware(train, oo_lt_data, oo_flat_lt, cov_flat, bias_flat, DEFAULT_LT_BW)
-apply_lt_aware(test, oo_lt_data, oo_flat_lt, cov_flat, bias_flat, DEFAULT_LT_BW)
+print(f"\n\n{'='*100}")
+print("BANDWIDTH SWEEP: OE bandwidth (h_lt fixed at default)")
+print("=" * 100)
+print(f"\n  {'h_oe':>5s} | {'WMAPE':>7s} | {'Bias':>7s} | {'R²':>6s} | {'%lt_oe':>7s} | {'%lt':>5s} | {'%flat':>6s}")
+print("  " + "-" * 55)
+# Also test h_oe=None (LT-only) as reference
+types = apply_lt_aware(test, oo_lt_data, oo_flat_lt, cov_flat, bias_flat, DEFAULT_LT_BW, None)
+v = test[test['oo_implied_lt'].notna() & (test['oo_implied_lt']>0) &
+         (test['Actual_Sales']>0) & test['gsa_site'].isin(clean_sites)]
+y, p = v['Actual_Sales'].values, v['oo_implied_lt'].values
+wmape = np.sum(np.abs(y-p))/np.sum(y)*100
+bias = np.mean((p-y)/y)*100
+r2 = 1 - np.sum((y-p)**2)/np.sum((y-np.mean(y))**2)
+tot = max(sum(types.values()), 1)
+pct_lt = types.get('lt_aware', 0) / tot * 100
+pct_fl = types.get('flat', 0) / tot * 100
+print(f"  {'none':>5s} | {wmape:>5.1f}% | {bias:>+5.1f}% | {r2:>.3f} | {'0.0':>5s}% | {pct_lt:>4.1f}% | {pct_fl:>4.1f}%  (LT-only ref)")
+for h_oe in OE_BANDWIDTHS:
+    types = apply_lt_aware(test, oo_lt_data, oo_flat_lt, cov_flat, bias_flat, DEFAULT_LT_BW, h_oe)
+    v = test[test['oo_implied_lt'].notna() & (test['oo_implied_lt']>0) &
+             (test['Actual_Sales']>0) & test['gsa_site'].isin(clean_sites)]
+    y, p = v['Actual_Sales'].values, v['oo_implied_lt'].values
+    wmape = np.sum(np.abs(y-p))/np.sum(y)*100
+    bias = np.mean((p-y)/y)*100
+    r2 = 1 - np.sum((y-p)**2)/np.sum((y-np.mean(y))**2)
+    tot = max(sum(types.values()), 1)
+    pct_2d = types.get('lt_oe_aware', 0) / tot * 100
+    pct_lt = types.get('lt_aware', 0) / tot * 100
+    pct_fl = types.get('flat', 0) / tot * 100
+    print(f"  {h_oe:>5.1f} | {wmape:>5.1f}% | {bias:>+5.1f}% | {r2:>.3f} | {pct_2d:>5.1f}% | {pct_lt:>4.1f}% | {pct_fl:>4.1f}%")
+
+# Restore default bandwidths for V8h model run
+apply_lt_aware(train, oo_lt_data, oo_flat_lt, cov_flat, bias_flat, DEFAULT_LT_BW, DEFAULT_OE_BW)
+apply_lt_aware(test, oo_lt_data, oo_flat_lt, cov_flat, bias_flat, DEFAULT_LT_BW, DEFAULT_OE_BW)
 
 # ============================================================
 # WEIGHTED AVERAGE COMBINATION
@@ -508,7 +566,7 @@ def weighted_avg(test_df, train_df, test_months, oo_col='oo_implied', fc_col='fc
     return results['pred']
 
 print(f"\n\n{'='*100}")
-print("FULL MODEL: V8d (flat) vs V8g (conditioned) vs V8h (LT-aware)")
+print("FULL MODEL: V8d (flat) vs V8g (conditioned) vs V8h (LT+OE kernel)")
 print("=" * 100)
 
 # V8d baseline
@@ -520,14 +578,14 @@ print("  Running V8g (conditioned curves)...")
 test['v8g'] = weighted_avg(test, train, test_months, 'oo_implied', 'fc_implied')
 
 # V8h LT-aware
-print("  Running V8h (LT-aware OO + flat FC)...")
+print("  Running V8h (LT+OE kernel OO + flat FC)...")
 test['v8h'] = weighted_avg(test, train, test_months, 'oo_implied_lt', 'fc_implied_lt')
 
 m2 = test['Reference_Month'] > test_months[0]
 
 print(f"\n  {'Model':>15s} | {'WMAPE':>7s} | {'Bias':>7s} | {'R²':>6s} | {'Acct':>6s}")
 print("  " + "-" * 50)
-for label, col in [('V8d (flat)', 'v8d'), ('V8g (cond)', 'v8g'), ('V8h (LT-aware)', 'v8h')]:
+for label, col in [('V8d (flat)', 'v8d'), ('V8g (cond)', 'v8g'), ('V8h (LT+OE)', 'v8h')]:
     ts = test[m2 & test[col].notna() & test['gsa_site'].isin(clean_sites)]
     y, p = ts['Actual_Sales'].values, ts[col].values
     w = np.sum(np.abs(y-p))/np.sum(y)*100
