@@ -637,6 +637,273 @@ for gs in top_sites:
     print()
 
 # ============================================================
+# DIAGNOSTIC: Attach per-row curve values to test DataFrame
+# ============================================================
+print(f"\n\n{'='*100}")
+print("DIAGNOSTICS: Understanding V8d error structure")
+print("=" * 100)
+
+# Attach flat curve values to each test row for drift analysis
+for ds in [test, train]:
+    oo_cv = np.full(len(ds), np.nan)
+    cov_cv = np.full(len(ds), np.nan)
+    bias_cv = np.full(len(ds), np.nan)
+    for i, (idx, row) in enumerate(ds.iterrows()):
+        gs, tf, lag = row['gsa_site'], row['Timeframe'], row['Prediction_Lag']
+        for key in [(gs, tf, lag), ('FB', gs, lag)]:
+            if key in oo_flat:
+                oo_cv[i] = oo_flat[key]; break
+        for key in [(gs, tf, lag), ('FB', gs, lag)]:
+            if key in cov_flat:
+                cov_cv[i] = cov_flat[key]; break
+        for key in [(gs, tf, lag), ('FB', gs, lag)]:
+            if key in bias_flat:
+                bias_cv[i] = bias_flat[key]; break
+    ds['oo_curve_val'] = oo_cv
+    ds['cov_curve_val'] = cov_cv
+    ds['bias_curve_val'] = bias_cv
+
+# Filter: test set, clean sites, positive actuals
+t = test[test['gsa_site'].isin(clean_sites) & (test['Actual_Sales'] > 0)].copy()
+
+# ============================================================
+# DIAGNOSTIC 1: Source of WMAPE
+# ============================================================
+print(f"\n--- DIAGNOSTIC 1: Source of WMAPE ---")
+
+# 1a: Per-signal WMAPE by lag
+print(f"\n  1a. Per-signal WMAPE by lag:")
+print(f"  {'Lag':>4s} | {'OO WMAPE':>9s} {'N':>5s} | {'FC WMAPE':>9s} {'N':>5s} | {'Gap':>7s}")
+print("  " + "-" * 50)
+for lag in sorted(t['Prediction_Lag'].unique()):
+    sub = t[t['Prediction_Lag'] == lag]
+    oo_v = sub[sub['oo_implied_flat'].notna() & (sub['oo_implied_flat'] > 0)]
+    fc_v = sub[sub['fc_implied_flat'].notna() & (sub['fc_implied_flat'] > 0)]
+    oo_w = np.sum(np.abs(oo_v['Actual_Sales'] - oo_v['oo_implied_flat'])) / np.sum(oo_v['Actual_Sales']) * 100 if len(oo_v) > 0 else np.nan
+    fc_w = np.sum(np.abs(fc_v['Actual_Sales'] - fc_v['fc_implied_flat'])) / np.sum(fc_v['Actual_Sales']) * 100 if len(fc_v) > 0 else np.nan
+    gap = oo_w - fc_w if not (np.isnan(oo_w) or np.isnan(fc_w)) else np.nan
+    gap_s = f"{gap:>+5.1f}pp" if not np.isnan(gap) else "   n/a"
+    print(f"  {lag:>4d} | {oo_w:>7.1f}% {len(oo_v):>5d} | {fc_w:>7.1f}% {len(fc_v):>5d} | {gap_s}")
+
+# 1b: Per-signal WMAPE by timeframe
+print(f"\n  1b. Per-signal WMAPE by timeframe:")
+print(f"  {'TF':>4s} | {'OO WMAPE':>9s} {'N':>5s} | {'FC WMAPE':>9s} {'N':>5s} | {'Gap':>7s}")
+print("  " + "-" * 50)
+for tf in sorted(t['Timeframe'].unique()):
+    sub = t[t['Timeframe'] == tf]
+    oo_v = sub[sub['oo_implied_flat'].notna() & (sub['oo_implied_flat'] > 0)]
+    fc_v = sub[sub['fc_implied_flat'].notna() & (sub['fc_implied_flat'] > 0)]
+    oo_w = np.sum(np.abs(oo_v['Actual_Sales'] - oo_v['oo_implied_flat'])) / np.sum(oo_v['Actual_Sales']) * 100 if len(oo_v) > 0 else np.nan
+    fc_w = np.sum(np.abs(fc_v['Actual_Sales'] - fc_v['fc_implied_flat'])) / np.sum(fc_v['Actual_Sales']) * 100 if len(fc_v) > 0 else np.nan
+    gap = oo_w - fc_w if not (np.isnan(oo_w) or np.isnan(fc_w)) else np.nan
+    gap_s = f"{gap:>+5.1f}pp" if not np.isnan(gap) else "   n/a"
+    print(f"  {tf:>4d} | {oo_w:>7.1f}% {len(oo_v):>5d} | {fc_w:>7.1f}% {len(fc_v):>5d} | {gap_s}")
+
+# 1c: Per-site WMAPE with volume weighting
+total_sales = t['Actual_Sales'].sum()
+print(f"\n  1c. Per-site WMAPE with volume contribution:")
+print(f"  {'Site':>15s} | {'Sales $M':>8s} | {'OO WMAPE':>9s} | {'FC WMAPE':>9s} | {'OO contrib':>10s} | {'FC contrib':>10s}")
+print("  " + "-" * 72)
+for gs in sorted(clean_sites):
+    site = gs.split('|')[1]
+    sub = t[t['gsa_site'] == gs]
+    sales = sub['Actual_Sales'].sum()
+    oo_v = sub[sub['oo_implied_flat'].notna() & (sub['oo_implied_flat'] > 0)]
+    fc_v = sub[sub['fc_implied_flat'].notna() & (sub['fc_implied_flat'] > 0)]
+    oo_ae = np.sum(np.abs(oo_v['Actual_Sales'] - oo_v['oo_implied_flat'])) if len(oo_v) > 0 else 0
+    fc_ae = np.sum(np.abs(fc_v['Actual_Sales'] - fc_v['fc_implied_flat'])) if len(fc_v) > 0 else 0
+    oo_w = oo_ae / np.sum(oo_v['Actual_Sales']) * 100 if len(oo_v) > 0 else np.nan
+    fc_w = fc_ae / np.sum(fc_v['Actual_Sales']) * 100 if len(fc_v) > 0 else np.nan
+    oo_c = oo_ae / total_sales * 100
+    fc_c = fc_ae / total_sales * 100
+    oo_ws = f"{oo_w:>7.1f}%" if not np.isnan(oo_w) else "     n/a"
+    fc_ws = f"{fc_w:>7.1f}%" if not np.isnan(fc_w) else "     n/a"
+    print(f"  {site:>15s} | {sales/1e6:>6.1f}M | {oo_ws:>9s} | {fc_ws:>9s} | {oo_c:>8.1f}pp | {fc_c:>8.1f}pp")
+
+# 1d: Blend improvement check
+both = t[t['oo_implied_flat'].notna() & (t['oo_implied_flat'] > 0) &
+         t['fc_implied_flat'].notna() & (t['fc_implied_flat'] > 0)].copy()
+both['simple_avg'] = (both['oo_implied_flat'] + both['fc_implied_flat']) / 2
+print(f"\n  1d. Blend improvement (rows with both signals, N={len(both)}):")
+print(f"  {'Signal':>15s} | {'WMAPE':>7s} | {'Bias':>7s}")
+print("  " + "-" * 35)
+for label, col in [('OO alone', 'oo_implied_flat'), ('FC alone', 'fc_implied_flat'), ('Simple avg', 'simple_avg')]:
+    w = np.sum(np.abs(both['Actual_Sales'] - both[col])) / np.sum(both['Actual_Sales']) * 100
+    b = np.sum(both[col] - both['Actual_Sales']) / np.sum(both['Actual_Sales']) * 100
+    print(f"  {label:>15s} | {w:>5.1f}% | {b:>+5.1f}%")
+
+# ============================================================
+# DIAGNOSTIC 2: Source of Bias
+# ============================================================
+print(f"\n--- DIAGNOSTIC 2: Source of Bias ---")
+
+# 2a: Per-signal bias by lag (volume-weighted)
+print(f"\n  2a. Per-signal volume-weighted bias by lag:")
+print(f"  {'Lag':>4s} | {'OO bias':>8s} | {'FC bias':>8s} | {'OO-FC':>7s}")
+print("  " + "-" * 35)
+for lag in sorted(t['Prediction_Lag'].unique()):
+    sub = t[t['Prediction_Lag'] == lag]
+    oo_v = sub[sub['oo_implied_flat'].notna() & (sub['oo_implied_flat'] > 0)]
+    fc_v = sub[sub['fc_implied_flat'].notna() & (sub['fc_implied_flat'] > 0)]
+    oo_b = np.sum(oo_v['oo_implied_flat'] - oo_v['Actual_Sales']) / np.sum(oo_v['Actual_Sales']) * 100 if len(oo_v) > 0 else np.nan
+    fc_b = np.sum(fc_v['fc_implied_flat'] - fc_v['Actual_Sales']) / np.sum(fc_v['Actual_Sales']) * 100 if len(fc_v) > 0 else np.nan
+    oo_s = f"{oo_b:>+6.1f}%" if not np.isnan(oo_b) else "    n/a"
+    fc_s = f"{fc_b:>+6.1f}%" if not np.isnan(fc_b) else "    n/a"
+    gap = oo_b - fc_b if not (np.isnan(oo_b) or np.isnan(fc_b)) else np.nan
+    gap_s = f"{gap:>+5.1f}pp" if not np.isnan(gap) else "   n/a"
+    print(f"  {lag:>4d} | {oo_s:>8s} | {fc_s:>8s} | {gap_s}")
+
+# 2b: Per-signal bias by site
+print(f"\n  2b. Per-signal volume-weighted bias by site:")
+print(f"  {'Site':>15s} | {'Sales $M':>8s} | {'OO bias':>8s} | {'FC bias':>8s}")
+print("  " + "-" * 48)
+for gs in sorted(clean_sites):
+    site = gs.split('|')[1]
+    sub = t[t['gsa_site'] == gs]
+    sales = sub['Actual_Sales'].sum()
+    oo_v = sub[sub['oo_implied_flat'].notna() & (sub['oo_implied_flat'] > 0)]
+    fc_v = sub[sub['fc_implied_flat'].notna() & (sub['fc_implied_flat'] > 0)]
+    oo_b = np.sum(oo_v['oo_implied_flat'] - oo_v['Actual_Sales']) / np.sum(oo_v['Actual_Sales']) * 100 if len(oo_v) > 0 else np.nan
+    fc_b = np.sum(fc_v['fc_implied_flat'] - fc_v['Actual_Sales']) / np.sum(fc_v['Actual_Sales']) * 100 if len(fc_v) > 0 else np.nan
+    oo_s = f"{oo_b:>+6.1f}%" if not np.isnan(oo_b) else "    n/a"
+    fc_s = f"{fc_b:>+6.1f}%" if not np.isnan(fc_b) else "    n/a"
+    print(f"  {site:>15s} | {sales/1e6:>6.1f}M | {oo_s:>8s} | {fc_s:>8s}")
+
+# 2c: Per-signal bias by timeframe
+print(f"\n  2c. Per-signal volume-weighted bias by timeframe:")
+print(f"  {'TF':>4s} | {'OO bias':>8s} | {'FC bias':>8s}")
+print("  " + "-" * 25)
+for tf in sorted(t['Timeframe'].unique()):
+    sub = t[t['Timeframe'] == tf]
+    oo_v = sub[sub['oo_implied_flat'].notna() & (sub['oo_implied_flat'] > 0)]
+    fc_v = sub[sub['fc_implied_flat'].notna() & (sub['fc_implied_flat'] > 0)]
+    oo_b = np.sum(oo_v['oo_implied_flat'] - oo_v['Actual_Sales']) / np.sum(oo_v['Actual_Sales']) * 100 if len(oo_v) > 0 else np.nan
+    fc_b = np.sum(fc_v['fc_implied_flat'] - fc_v['Actual_Sales']) / np.sum(fc_v['Actual_Sales']) * 100 if len(fc_v) > 0 else np.nan
+    oo_s = f"{oo_b:>+6.1f}%" if not np.isnan(oo_b) else "    n/a"
+    fc_s = f"{fc_b:>+6.1f}%" if not np.isnan(fc_b) else "    n/a"
+    print(f"  {tf:>4d} | {oo_s:>8s} | {fc_s:>8s}")
+
+# ============================================================
+# DIAGNOSTIC 3: Curve Drift
+# ============================================================
+print(f"\n--- DIAGNOSTIC 3: Curve Drift (train curve vs test-period actual) ---")
+
+# Compute per-row drift: (curve_value - actual_ratio) / actual_ratio
+td = t.copy()
+td['oo_drift'] = np.where(td['oo_ratio'].notna() & (td['oo_ratio'] > 0.001) & td['oo_curve_val'].notna(),
+                           (td['oo_curve_val'] - td['oo_ratio']) / td['oo_ratio'] * 100, np.nan)
+td['cov_drift'] = np.where(td['fc_coverage'].notna() & (td['fc_coverage'] > 0.001) & td['cov_curve_val'].notna(),
+                            (td['cov_curve_val'] - td['fc_coverage']) / td['fc_coverage'] * 100, np.nan)
+td['bias_drift'] = np.where(td['fc_bias'].notna() & (td['fc_bias'] > 0.001) & td['bias_curve_val'].notna(),
+                              (td['bias_curve_val'] - td['fc_bias']) / td['fc_bias'] * 100, np.nan)
+
+# 3a: Cell-level drift summary
+print(f"\n  3a. Overall drift summary (positive = curve overestimates ratio):")
+print(f"  {'Metric':>20s} | {'OO ratio':>10s} | {'FC coverage':>12s} | {'FC bias':>10s}")
+print("  " + "-" * 60)
+for label, col in [('Median drift %', 'med'), ('Vol-wtd mean %', 'vw'), ('% cells curve>act', 'pct')]:
+    vals = []
+    for dcol in ['oo_drift', 'cov_drift', 'bias_drift']:
+        valid = td[td[dcol].notna()]
+        if label == 'Median drift %':
+            vals.append(f"{valid[dcol].median():>+8.1f}%")
+        elif label == 'Vol-wtd mean %':
+            wm = np.average(valid[dcol], weights=valid['Actual_Sales'])
+            vals.append(f"{wm:>+8.1f}%")
+        else:
+            pct = (valid[dcol] > 0).mean() * 100
+            vals.append(f"{pct:>7.0f}% ")
+    print(f"  {label:>20s} | {vals[0]:>10s} | {vals[1]:>12s} | {vals[2]:>10s}")
+print(f"  {'N rows':>20s} | {td['oo_drift'].notna().sum():>10d} | {td['cov_drift'].notna().sum():>12d} | {td['bias_drift'].notna().sum():>10d}")
+
+# 3b: Drift by lag
+print(f"\n  3b. Volume-weighted drift by lag:")
+print(f"  {'Lag':>4s} | {'OO drift':>9s} | {'Cov drift':>10s} | {'Bias drift':>11s}")
+print("  " + "-" * 42)
+for lag in sorted(td['Prediction_Lag'].unique()):
+    sub = td[td['Prediction_Lag'] == lag]
+    vals = []
+    for dcol in ['oo_drift', 'cov_drift', 'bias_drift']:
+        v = sub[sub[dcol].notna()]
+        if len(v) > 0:
+            wm = np.average(v[dcol], weights=v['Actual_Sales'])
+            vals.append(f"{wm:>+7.1f}%")
+        else:
+            vals.append("     n/a")
+    print(f"  {lag:>4d} | {vals[0]:>9s} | {vals[1]:>10s} | {vals[2]:>11s}")
+
+# 3c: Drift by site
+print(f"\n  3c. Volume-weighted drift by site:")
+print(f"  {'Site':>15s} | {'Sales $M':>8s} | {'OO drift':>9s} | {'Cov drift':>10s} | {'Bias drift':>11s}")
+print("  " + "-" * 62)
+for gs in sorted(clean_sites):
+    site = gs.split('|')[1]
+    sub = td[td['gsa_site'] == gs]
+    sales = sub['Actual_Sales'].sum()
+    vals = []
+    for dcol in ['oo_drift', 'cov_drift', 'bias_drift']:
+        v = sub[sub[dcol].notna()]
+        if len(v) > 0:
+            wm = np.average(v[dcol], weights=v['Actual_Sales'])
+            vals.append(f"{wm:>+7.1f}%")
+        else:
+            vals.append("     n/a")
+    print(f"  {site:>15s} | {sales/1e6:>6.1f}M | {vals[0]:>9s} | {vals[1]:>10s} | {vals[2]:>11s}")
+
+# 3d: Temporal trend — volume-weighted average ratios by month
+print(f"\n  3d. Temporal trend (volume-weighted avg ratios by month):")
+full = df[df['gsa_site'].isin(clean_sites) & (df['Actual_Sales'] > 0)].copy()
+all_months = sorted(full['Reference_Month'].unique())
+
+def print_temporal_trend(data, months, cutoff_date, label="Overall"):
+    print(f"\n  [{label}]")
+    print(f"  {'Month':>12s} | {'Period':>6s} | {'OO ratio':>9s} | {'FC cov':>7s} | {'FC bias':>8s} | {'N':>4s}")
+    print("  " + "-" * 58)
+    for m in months:
+        sub = data[data['Reference_Month'] == m]
+        if len(sub) == 0:
+            continue
+        period = "TRAIN" if m <= cutoff_date else "TEST"
+        vals = []
+        for col in ['oo_ratio', 'fc_coverage', 'fc_bias']:
+            v = sub[sub[col].notna() & (sub[col] > 0) & (sub[col] < 10)]
+            if len(v) > 0:
+                wm = np.average(v[col], weights=v['Actual_Sales'])
+                vals.append(f"{wm:>7.3f}")
+            else:
+                vals.append("    n/a")
+        sep = "  " if period == "TRAIN" else ">>"
+        print(f"  {m.date()} | {period:>6s} | {vals[0]:>9s} | {vals[1]:>7s} | {vals[2]:>8s} | {len(sub):>4d}")
+
+print_temporal_trend(full, all_months, cutoff, "Overall")
+for gs in top_sites:
+    site = gs.split('|')[1]
+    site_data = full[full['gsa_site'] == gs]
+    site_months = sorted(site_data['Reference_Month'].unique())
+    print_temporal_trend(site_data, site_months, cutoff, site)
+
+# 3e: Drift direction vs bias direction (2x2 contingency)
+print(f"\n  3e. Drift direction vs prediction bias direction (per cell):")
+print(f"      (OO curve drift > 0 means curve overestimates OO ratio -> divides by too much -> underpredicts)")
+cells = td.groupby(['gsa_site', 'Timeframe', 'Prediction_Lag']).agg(
+    oo_drift_mean=('oo_drift', 'mean'),
+    oo_pred_bias=('oo_implied_flat', lambda x: np.nan if x.isna().all() else
+                  (x.dropna().values - td.loc[x.dropna().index, 'Actual_Sales'].values).sum() /
+                  td.loc[x.dropna().index, 'Actual_Sales'].values.sum() * 100)
+).dropna()
+if len(cells) > 0:
+    drift_pos = cells['oo_drift_mean'] > 0
+    bias_neg = cells['oo_pred_bias'] < 0
+    print(f"\n  {'':>25s} | {'Pred bias < 0':>14s} | {'Pred bias > 0':>14s}")
+    print("  " + "-" * 58)
+    print(f"  {'OO curve > test (drift+)':>25s} | {(drift_pos & bias_neg).sum():>10d}    | {(drift_pos & ~bias_neg).sum():>10d}")
+    print(f"  {'OO curve < test (drift-)':>25s} | {(~drift_pos & bias_neg).sum():>10d}    | {(~drift_pos & ~bias_neg).sum():>10d}")
+    n_diag = (drift_pos & bias_neg).sum() + (~drift_pos & ~bias_neg).sum()
+    n_off = (drift_pos & ~bias_neg).sum() + (~drift_pos & bias_neg).sum()
+    print(f"\n  Diagonal (drift explains bias): {n_diag}/{len(cells)} = {n_diag/len(cells)*100:.0f}%")
+    print(f"  Off-diagonal (drift contradicts): {n_off}/{len(cells)} = {n_off/len(cells)*100:.0f}%")
+
+# ============================================================
 # WEIGHTED AVERAGE COMBINATION
 # ============================================================
 def weighted_avg(test_df, train_df, test_months, oo_col='oo_implied', fc_col='fc_implied',
