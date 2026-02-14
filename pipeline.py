@@ -252,6 +252,70 @@ def apply_multi_vintage_fc(dset, cov_f, bias_f, registry, causality='temporal'):
     dset['best_vintage_lag'] = best_lag
 
 
+# ---- Multi-Vintage OO ----
+
+def build_oo_registry(data_df):
+    """Index OO observations by target period for multi-vintage OO.
+
+    Returns {(gsa_site, TP_Start, TP_End): [dicts sorted by lag asc]}
+    """
+    registry = {}
+    for _, row in data_df.iterrows():
+        if row['Open_Orders'] <= 0 or pd.isna(row['Actual_Sales']) or row['Actual_Sales'] <= 0:
+            continue
+        key = (row['gsa_site'], row['Target_Period_Start'], row['Target_Period_End'])
+        if key not in registry:
+            registry[key] = []
+        registry[key].append({
+            'ref_month': row['Reference_Month'],
+            'lag': row['Prediction_Lag'],
+            'oo': row['Open_Orders'],
+            'tf': row['Timeframe'],
+            'gsa_site': row['gsa_site'],
+        })
+    for key in registry:
+        registry[key].sort(key=lambda v: v['lag'])
+    return registry
+
+
+def _get_oo_curve(oo_f, gs, tf, lag):
+    """Look up flat OO curve value with fallback."""
+    for key in [(gs, tf, lag), ('FB', gs, lag)]:
+        if key in oo_f and oo_f[key] > 0.001:
+            return oo_f[key]
+    return None
+
+
+def apply_multi_vintage_oo(dset, oo_f, registry, causality='temporal'):
+    """Multi-vintage OO: combine OO/curve(L) across all causally-valid lags.
+
+    Adds column: oo_implied_multi
+    """
+    n = len(dset)
+    oo_multi = np.full(n, np.nan)
+
+    for i, (idx, row) in enumerate(dset.iterrows()):
+        gs = row['gsa_site']
+        tp_key = (gs, row['Target_Period_Start'], row['Target_Period_End'])
+
+        if tp_key not in registry:
+            continue
+
+        estimates = []
+        for v in registry[tp_key]:
+            if causality == 'temporal' and v['ref_month'] > row['Reference_Month']:
+                continue
+            cv = _get_oo_curve(oo_f, v['gsa_site'], v['tf'], v['lag'])
+            if cv is not None and v['oo'] > 0:
+                implied = v['oo'] / cv
+                estimates.append((max(implied, 0), v['lag']))
+
+        if estimates:
+            oo_multi[i] = max(_combine_vintage_estimates(estimates), 0)
+
+    dset['oo_implied_multi'] = oo_multi
+
+
 # ---- FC Debiasing ----
 
 def build_fc_debias_curves(train_df):
@@ -483,10 +547,10 @@ def run_customer_pipeline(cust_df, customer_name):
     apply_flat_curves(test, oo_flat, cov_flat, bias_flat)
 
     # ---- Build and apply multi-vintage FC ----
-    registry_all = build_forecast_registry(df)
-    print(f"    Forecast registry: {len(registry_all)} target periods with forecasts")
-    apply_multi_vintage_fc(train, cov_flat, bias_flat, registry_all, causality='temporal')
-    apply_multi_vintage_fc(test, cov_flat, bias_flat, registry_all, causality='temporal')
+    fc_registry = build_forecast_registry(df)
+    print(f"    FC registry: {len(fc_registry)} target periods with forecasts")
+    apply_multi_vintage_fc(train, cov_flat, bias_flat, fc_registry, causality='temporal')
+    apply_multi_vintage_fc(test, cov_flat, bias_flat, fc_registry, causality='temporal')
 
     n_single = test['fc_implied_flat'].notna().sum()
     n_multi = test['fc_implied_multi'].notna().sum()
@@ -494,6 +558,19 @@ def run_customer_pipeline(cust_df, customer_name):
           f"({100 * n_single / len(test):.0f}%)")
     print(f"    Multi-vintage FC coverage:  {n_multi}/{len(test)} "
           f"({100 * n_multi / len(test):.0f}%)")
+
+    # ---- Build and apply multi-vintage OO ----
+    oo_registry = build_oo_registry(df)
+    print(f"    OO registry: {len(oo_registry)} target periods with OO data")
+    apply_multi_vintage_oo(train, oo_flat, oo_registry, causality='temporal')
+    apply_multi_vintage_oo(test, oo_flat, oo_registry, causality='temporal')
+
+    n_oo_s = test['oo_implied_flat'].notna().sum()
+    n_oo_m = test['oo_implied_multi'].notna().sum()
+    print(f"    Single-vintage OO coverage: {n_oo_s}/{len(test)} "
+          f"({100 * n_oo_s / len(test):.0f}%)")
+    print(f"    Multi-vintage OO coverage:  {n_oo_m}/{len(test)} "
+          f"({100 * n_oo_m / len(test):.0f}%)")
 
     # ---- FC debiasing ----
     fc_debias = build_fc_debias_curves(train)
@@ -515,6 +592,8 @@ def run_customer_pipeline(cust_df, customer_name):
         'FC-only debiased':  ('oo_none',         'fc_implied_debiased'),
         'V8d + multi-FC':    ('oo_implied_flat', 'fc_implied_multi'),
         'FC-only multi':     ('oo_none',         'fc_implied_multi'),
+        'mOO + mFC':         ('oo_implied_multi', 'fc_implied_multi'),
+        'mOO + FC flat':     ('oo_implied_multi', 'fc_implied_flat'),
     }
 
     temporal_results = {}
@@ -609,10 +688,15 @@ def run_customer_pipeline(cust_df, customer_name):
         apply_fc_debias(f_train, fold_debias)
         apply_fc_debias(f_test, fold_debias)
 
-        # Multi-vintage from TRAINING fold only
-        registry_fold = build_forecast_registry(f_train)
-        apply_multi_vintage_fc(f_train, cov_f, bias_f, registry_fold, causality='fold')
-        apply_multi_vintage_fc(f_test, cov_f, bias_f, registry_fold, causality='fold')
+        # Multi-vintage FC from TRAINING fold only
+        fc_registry_fold = build_forecast_registry(f_train)
+        apply_multi_vintage_fc(f_train, cov_f, bias_f, fc_registry_fold, causality='fold')
+        apply_multi_vintage_fc(f_test, cov_f, bias_f, fc_registry_fold, causality='fold')
+
+        # Multi-vintage OO from TRAINING fold only
+        oo_registry_fold = build_oo_registry(f_train)
+        apply_multi_vintage_oo(f_train, oo_f, oo_registry_fold, causality='fold')
+        apply_multi_vintage_oo(f_test, oo_f, oo_registry_fold, causality='fold')
 
         f_train['oo_none'] = np.nan
         f_test['oo_none'] = np.nan
@@ -636,7 +720,8 @@ def run_customer_pipeline(cust_df, customer_name):
         # Per-fold summary
         v8d_w = fold_metrics['V8d (OO+FC)'][-1]['wmape'] if fold_metrics['V8d (OO+FC)'] else 0
         fm_w = fold_metrics['FC-only multi'][-1]['wmape'] if fold_metrics['FC-only multi'] else 0
-        print(f"    Fold {fold_i + 1}: V8d={v8d_w:.1f}%  FC-multi={fm_w:.1f}%")
+        mm_w = fold_metrics['mOO + mFC'][-1]['wmape'] if fold_metrics['mOO + mFC'] else 0
+        print(f"    Fold {fold_i + 1}: V8d={v8d_w:.1f}%  mOO+mFC={mm_w:.1f}%  FC-multi={fm_w:.1f}%")
 
     # Random CV summary
     print(f"\n  {'Model':>22s} | {'Random CV (mean +/- std)':>26s} | {'Temporal':>10s} | {'Gap':>6s}")
@@ -681,13 +766,14 @@ def run_customer_pipeline(cust_df, customer_name):
 
     # Per-fold detail
     print(f"\n  Per-fold WMAPE:")
-    print(f"  {'Fold':>6s} | {'V8d':>8s} | {'V8d+mFC':>8s} | {'FC-multi':>8s}")
-    print(f"  {'-' * 40}")
+    print(f"  {'Fold':>6s} | {'V8d':>8s} | {'mOO+mFC':>8s} | {'V8d+mFC':>8s} | {'FC-multi':>8s}")
+    print(f"  {'-' * 50}")
     for i in range(N_FOLDS):
         v8d_w = fold_metrics['V8d (OO+FC)'][i]['wmape'] if i < len(fold_metrics['V8d (OO+FC)']) else np.nan
+        mm_w = fold_metrics['mOO + mFC'][i]['wmape'] if i < len(fold_metrics['mOO + mFC']) else np.nan
         dm_w = fold_metrics['V8d + multi-FC'][i]['wmape'] if i < len(fold_metrics['V8d + multi-FC']) else np.nan
         fm_w = fold_metrics['FC-only multi'][i]['wmape'] if i < len(fold_metrics['FC-only multi']) else np.nan
-        print(f"  {'F' + str(i + 1):>6s} | {v8d_w:>6.1f}% | {dm_w:>6.1f}% | {fm_w:>6.1f}%")
+        print(f"  {'F' + str(i + 1):>6s} | {v8d_w:>6.1f}% | {mm_w:>6.1f}% | {dm_w:>6.1f}% | {fm_w:>6.1f}%")
 
     return {
         'customer': customer_name,
