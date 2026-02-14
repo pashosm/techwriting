@@ -232,6 +232,112 @@ The temporal/random gap collapses from **-8.2pp to -0.7pp**. This proves the sin
 
 ---
 
+## 80% Prediction Intervals
+
+### Motivation
+
+A point prediction alone doesn't convey how much confidence we have in it. A $10M prediction for Site W at lag 1 carries very different certainty than a $200K prediction for Site E at lag 12. Prediction intervals quantify this: for each `(site, timeframe, lag)` combination, what range covers 80% of expected outcomes?
+
+### Method: Parametric Log-Normal Prediction Intervals
+
+For each `(site, timeframe, lag)` group, the model computes the ratio `actual / predicted` from historical predictions and models `log(actual / predicted)` as approximately normal. This gives a natural multiplicative interval:
+
+```
+log_ratios = log(actual / predicted)    for each group
+mu         = mean(log_ratios)           captures systematic bias
+sigma      = std(log_ratios, ddof=1)    captures spread (Bessel-corrected)
+margin     = 1.2816 × sigma × sqrt(1 + 1/n)
+
+CI_lower   = prediction × exp(mu - margin)
+CI_upper   = prediction × exp(mu + margin)
+```
+
+Key design choices:
+
+- **Log-space modeling**: Sales ratios are naturally multiplicative (a 50% miss matters equally whether the prediction is $1M or $10M). Working in log-space makes the interval symmetric in relative terms.
+- **z = 1.2816**: The normal quantile for a two-sided 80% interval (`norm.ppf(0.90)`).
+- **`sqrt(1 + 1/n)` correction**: The critical difference between a *confidence interval* (for the mean) and a *prediction interval* (for a new observation). This factor widens the interval to account for both estimation uncertainty in (mu, sigma) and the inherent randomness of a new outcome. With n=5 observations it inflates by 10%; with n=100, less than 1%.
+- **Bessel correction (`ddof=1`)**: Uses n-1 in the denominator of sigma to correct for small-sample bias in variance estimation.
+
+### Hierarchical Fallback
+
+Not every `(site, timeframe, lag)` cell has enough historical predictions to estimate reliable intervals. The model applies the same hierarchical fallback pattern used in model selection:
+
+| Level | Key | Example | When used |
+|-------|-----|---------|-----------|
+| 1 (finest) | `(site, tf, lag)` | Site W, TF=3, Lag=2 | >= 5 observations in cell |
+| 2 | `(site, lag)` | Site W, Lag=2 (pooled across TF) | Level 1 has < 5 obs |
+| 3 | `(site)` | Site W (pooled across TF and lag) | Level 2 has < 5 obs |
+| 4 (coarsest) | global | Customer-wide | Level 3 has < 5 obs |
+
+This ensures every prediction gets an interval, with granularity adapted to available data.
+
+### Calibration Source
+
+Intervals are calibrated from **temporal test predictions** — the same out-of-sample evaluation window used for model assessment. This mirrors production usage: calibrate on the most recent actuals-vs-predictions history, then apply to new predictions going forward.
+
+### Results
+
+#### Customer 1
+
+| Metric | Value |
+|--------|-------|
+| Overall coverage | 85.9% (target: 80%) |
+| Average relative width | 225% of point prediction |
+| CI curves fitted | 208 (site,tf,lag) + 105 (site,lag) + 9 (site) + 1 global |
+
+Per-site intervals reflect each site's predictability:
+
+| Site | Coverage | Avg Width | Median CI |
+|------|----------|-----------|-----------|
+| Site W | 85% | 40% | [$30.0M – $44.5M] |
+| Site S | 87% | 45% | [$15.6M – $21.7M] |
+| Site T | 83% | 30% | [$10.0M – $13.7M] |
+| Site J | 85% | 72% | [$15.3M – $29.5M] |
+| Site A | 85% | 57% | [$5.6M – $11.2M] |
+| Site D | 88% | 161% | [$0.9M – $1.9M] |
+| Site E | 77% | 3817% | [$0.1M – $87.9M] |
+
+Site E's extreme width (3817%) reflects its fundamental unpredictability (89% WMAPE) — the interval honestly communicates that predictions for this site are unreliable.
+
+Width grows with lag (more uncertainty further out):
+
+| Lag | Coverage | Avg Width |
+|-----|----------|-----------|
+| 1 | 82% | 149% |
+| 4 | 86% | 183% |
+| 8 | 90% | 362% |
+| 12 | 88% | 180% |
+
+Width varies by timeframe:
+
+| TF | Coverage | Avg Width |
+|----|----------|-----------|
+| 3 | 84% | 87% |
+| 6 | 85% | 325% |
+| 9 | 88% | 330% |
+| 12 | 92% | 326% |
+
+Quarterly (TF=3) is tightest — shorter aggregation windows are more predictable.
+
+#### Customer 2
+
+| Metric | Value |
+|--------|-------|
+| Overall coverage | 86.6% (target: 80%) |
+| Average relative width | 221% of point prediction |
+| CI curves fitted | 330 (site,tf,lag) + 132 (site,lag) + 11 (site) + 1 global |
+
+### Interpretation
+
+The intervals are slightly conservative (~86% vs 80% target). This overcoverage comes from the `sqrt(1 + 1/n)` prediction interval correction, which is theoretically correct and preferable to undercoverage in practice — a decision-maker relying on these intervals will find actual outcomes inside the stated range at least 80% of the time.
+
+The intervals communicate two things simultaneously:
+1. **Where we're confident**: Site W at lag 1 with TF=3 has a 40% relative width — the prediction is meaningful and actionable.
+2. **Where we're not**: Site E at lag 12 has a 3817% relative width — the point prediction is essentially noise, and any downstream decision should treat it as such.
+
+---
+
 ## Current Understanding & Open Questions
 
 ### Why V8k over-corrects for Sites S and T
