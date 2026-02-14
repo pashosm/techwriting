@@ -37,6 +37,8 @@ RANDOM_SEED = 42
 OO_NONSTATIONARY_GAP = 20  # If random CV WMAPE exceeds temporal by this many pp, flag OO
 LAG_BUCKETS = {'short': (1, 3), 'medium': (4, 7), 'long': (8, 12)}
 MIN_FOLDS_FOR_GAP = 3      # Need at least this many folds with observations to trust gap
+CI_LEVEL = 0.80            # Prediction interval coverage target
+MIN_OBS_CI = 5             # Minimum observations to compute quantiles at a granularity level
 
 # ============================================================
 # CORE FUNCTIONS
@@ -574,6 +576,82 @@ def build_model_selection_table(gsa_sites, models,
     return selection
 
 
+def build_prediction_intervals(actuals, preds, sites, timeframes, lags):
+    """Build parametric prediction interval ratios from out-of-sample data.
+
+    Models log(actual/predicted) as normal per (site, tf, lag) group.
+    Uses a prediction interval with small-sample correction:
+        margin = z * sigma * sqrt(1 + 1/n)
+    which widens intervals when data is sparse.
+
+    Hierarchical fallback: (site,tf,lag) → (site,lag) → (site) → global.
+
+    Parameters
+    ----------
+    actuals, preds : array-like of actual and predicted values
+    sites, timeframes, lags : array-like of corresponding metadata
+
+    Returns
+    -------
+    ci_lookup : dict mapping group keys to (q_lower, q_upper) ratio pairs.
+    """
+    Z_80 = 1.2816  # norm.ppf(0.90) for 80% two-sided interval
+
+    a = np.asarray(actuals, dtype=float)
+    p = np.asarray(preds, dtype=float)
+    valid = (p > 0) & (a > 0) & np.isfinite(p) & np.isfinite(a)
+    if valid.sum() < MIN_OBS_CI:
+        return {}
+
+    df = pd.DataFrame({
+        'log_r': np.log(a[valid] / p[valid]),
+        's': np.asarray(sites)[valid],
+        't': np.asarray(timeframes)[valid],
+        'l': np.asarray(lags)[valid],
+    })
+
+    def _interval(grp):
+        n = len(grp)
+        mu = grp['log_r'].mean()
+        sigma = grp['log_r'].std(ddof=1)  # Bessel-corrected
+        margin = Z_80 * sigma * np.sqrt(1 + 1 / n)
+        return (np.exp(mu - margin), np.exp(mu + margin))
+
+    ci = {}
+
+    # Level 1: (site, tf, lag)
+    for (sv, tv, lv), grp in df.groupby(['s', 't', 'l']):
+        if len(grp) >= MIN_OBS_CI:
+            ci[(sv, tv, lv)] = _interval(grp)
+
+    # Level 2: (site, lag) — pooled across timeframes
+    for (sv, lv), grp in df.groupby(['s', 'l']):
+        if len(grp) >= MIN_OBS_CI:
+            ci[('FB_lag', sv, lv)] = _interval(grp)
+
+    # Level 3: (site) — pooled across tf and lag
+    for sv, grp in df.groupby('s'):
+        if len(grp) >= MIN_OBS_CI:
+            ci[('FB_site', sv)] = _interval(grp)
+
+    # Level 4: global
+    ci['FB_global'] = _interval(df)
+
+    return ci
+
+
+def lookup_ci(ci_lookup, site, tf, lag):
+    """Look up CI ratio pair with hierarchical fallback.
+
+    Returns (q_lower, q_upper) — multiply prediction by these to get interval.
+    """
+    for key in [(site, tf, lag), ('FB_lag', site, lag),
+                ('FB_site', site), 'FB_global']:
+        if key in ci_lookup:
+            return ci_lookup[key]
+    return (np.nan, np.nan)
+
+
 # ============================================================
 # PER-CUSTOMER PIPELINE
 # ============================================================
@@ -781,6 +859,7 @@ def run_customer_pipeline(cust_df, customer_name):
     fold_metrics = {mn: [] for mn in models}
     fold_site_metrics = {}       # {(gs, model_name): [wmape_per_fold]}
     fold_site_lag_metrics = {}   # {(gs, lb, model_name): [wmape_per_fold]}
+    cv_oof_dfs = []              # out-of-fold predictions for CI calibration
 
     for fold_i in range(N_FOLDS):
         fold_start = fold_i * fold_size
@@ -861,6 +940,11 @@ def run_customer_pipeline(cust_df, customer_name):
                         fold_site_lag_metrics[sl_key].append(
                             compute_wmape(v['Actual_Sales'].values,
                                           v[model_name].values))
+
+        # Collect out-of-fold predictions for CI calibration
+        oof_cols = (['gsa_site', 'Timeframe', 'Prediction_Lag', 'Actual_Sales']
+                    + list(models.keys()))
+        cv_oof_dfs.append(f_test[oof_cols].copy())
 
         # Per-fold summary
         v8d_w = fold_metrics['V8d (OO+FC)'][-1]['wmape'] if fold_metrics['V8d (OO+FC)'] else 0
@@ -974,6 +1058,97 @@ def run_customer_pipeline(cust_df, customer_name):
         fm_w = fold_metrics['FC-only multi'][i]['wmape'] if i < len(fold_metrics['FC-only multi']) else np.nan
         print(f"  {'F' + str(i + 1):>6s} | {v8d_w:>6.1f}% | {mm_w:>6.1f}% | {dm_w:>6.1f}% | {fm_w:>6.1f}%")
 
+    # ---- 80% Prediction Intervals (calibrated from CV out-of-fold data) ----
+    print(f"\n  {'=' * 80}")
+    print(f"  80% PREDICTION INTERVALS — {customer_name}")
+    print(f"  {'=' * 80}")
+
+    # Calibrate from temporal test predictions (same source as production:
+    # recent actuals vs predictions, specific to site/tf/lag)
+    ci_data = test[m2 & test['selected'].notna() & (test['Actual_Sales'] > 0)]
+    print(f"  Calibration: {len(ci_data)} temporal test predictions (months 2+)")
+
+    ci_lookup = build_prediction_intervals(
+        ci_data['Actual_Sales'].values, ci_data['selected'].values,
+        ci_data['gsa_site'].values, ci_data['Timeframe'].values,
+        ci_data['Prediction_Lag'].values)
+
+    # Count keys at each level
+    n_stl = sum(1 for k in ci_lookup if isinstance(k, tuple) and len(k) == 3
+                and k[0] != 'FB_lag' and k[0] != 'FB_site')
+    n_sl = sum(1 for k in ci_lookup if isinstance(k, tuple) and len(k) == 3
+               and k[0] == 'FB_lag')
+    n_s = sum(1 for k in ci_lookup if isinstance(k, tuple) and len(k) == 2
+              and k[0] == 'FB_site')
+    print(f"  CI curves: {n_stl} (site,tf,lag) + {n_sl} (site,lag) + "
+          f"{n_s} (site) + 1 global fallback")
+
+    # Apply to temporal test set
+    test['ci_lower'] = np.nan
+    test['ci_upper'] = np.nan
+    for idx in test.index:
+        pred = test.at[idx, 'selected']
+        if pd.isna(pred) or pred <= 0:
+            continue
+        q_lo, q_hi = lookup_ci(ci_lookup, test.at[idx, 'gsa_site'],
+                               test.at[idx, 'Timeframe'],
+                               test.at[idx, 'Prediction_Lag'])
+        test.at[idx, 'ci_lower'] = pred * q_lo
+        test.at[idx, 'ci_upper'] = pred * q_hi
+
+    # Coverage and width statistics
+    ci_rows = test[m2 & test['ci_lower'].notna() & (test['Actual_Sales'] > 0)]
+    if len(ci_rows) > 0:
+        in_ci = ((ci_rows['Actual_Sales'] >= ci_rows['ci_lower']) &
+                 (ci_rows['Actual_Sales'] <= ci_rows['ci_upper']))
+        coverage = in_ci.mean() * 100
+        rel_width = ((ci_rows['ci_upper'] - ci_rows['ci_lower']) /
+                     ci_rows['selected']).mean() * 100
+        print(f"\n  Overall coverage: {coverage:.1f}% (target: {CI_LEVEL * 100:.0f}%)")
+        print(f"  Average relative CI width: {rel_width:.0f}% of point prediction")
+
+        # Per-site breakdown
+        print(f"\n  {'Site':>25s} | {'Coverage':>9s} | {'Avg Width':>10s} | "
+              f"{'Median CI':>18s} | {'N':>4s}")
+        print(f"  {'-' * 78}")
+        for gs in gsa_sites:
+            sub = ci_rows[ci_rows['gsa_site'] == gs]
+            if len(sub) == 0:
+                continue
+            s_in = ((sub['Actual_Sales'] >= sub['ci_lower']) &
+                    (sub['Actual_Sales'] <= sub['ci_upper']))
+            s_cov = s_in.mean() * 100
+            s_wid = ((sub['ci_upper'] - sub['ci_lower']) /
+                     sub['selected']).mean() * 100
+            med_lo = sub['ci_lower'].median()
+            med_hi = sub['ci_upper'].median()
+            print(f"  {gs:>25s} | {s_cov:>7.0f}% | {s_wid:>8.0f}% | "
+                  f"[{med_lo:>7,.0f} – {med_hi:>7,.0f}] | {len(sub):>4d}")
+
+        # Per-lag breakdown
+        print(f"\n  {'Lag':>4s} | {'Coverage':>9s} | {'Avg Width':>10s} | {'N':>4s}")
+        print(f"  {'-' * 35}")
+        for lag in sorted(ci_rows['Prediction_Lag'].unique()):
+            sub = ci_rows[ci_rows['Prediction_Lag'] == lag]
+            s_in = ((sub['Actual_Sales'] >= sub['ci_lower']) &
+                    (sub['Actual_Sales'] <= sub['ci_upper']))
+            s_cov = s_in.mean() * 100
+            s_wid = ((sub['ci_upper'] - sub['ci_lower']) /
+                     sub['selected']).mean() * 100
+            print(f"  {lag:>4d} | {s_cov:>7.0f}% | {s_wid:>8.0f}% | {len(sub):>4d}")
+
+        # Per-timeframe breakdown
+        print(f"\n  {'Timeframe':>12s} | {'Coverage':>9s} | {'Avg Width':>10s} | {'N':>4s}")
+        print(f"  {'-' * 43}")
+        for tf in sorted(ci_rows['Timeframe'].unique()):
+            sub = ci_rows[ci_rows['Timeframe'] == tf]
+            s_in = ((sub['Actual_Sales'] >= sub['ci_lower']) &
+                    (sub['Actual_Sales'] <= sub['ci_upper']))
+            s_cov = s_in.mean() * 100
+            s_wid = ((sub['ci_upper'] - sub['ci_lower']) /
+                     sub['selected']).mean() * 100
+            print(f"  {str(tf):>12s} | {s_cov:>7.0f}% | {s_wid:>8.0f}% | {len(sub):>4d}")
+
     return {
         'customer': customer_name,
         'n_rows': len(df),
@@ -986,6 +1161,7 @@ def run_customer_pipeline(cust_df, customer_name):
         'oo_nonstationary': oo_nonstationary,
         'customer_recommended': customer_recommended,
         'selection_table': selection_table,
+        'ci_lookup': ci_lookup,
     }
 
 
