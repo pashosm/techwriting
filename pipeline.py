@@ -35,6 +35,8 @@ VINTAGE_RECENCY_POWER = 1.5  # Power for inverse-lag weighting in multi-vintage
 N_FOLDS = 5                # Number of folds for random CV
 RANDOM_SEED = 42
 OO_NONSTATIONARY_GAP = 20  # If random CV WMAPE exceeds temporal by this many pp, flag OO
+LAG_BUCKETS = {'short': (1, 3), 'medium': (4, 7), 'long': (8, 12)}
+MIN_FOLDS_FOR_GAP = 3      # Need at least this many folds with observations to trust gap
 
 # ============================================================
 # CORE FUNCTIONS
@@ -483,6 +485,95 @@ def compute_bias(actual, predicted):
     return np.mean((predicted[mask] - actual[mask]) / actual[mask]) * 100
 
 
+def lag_to_bucket(lag):
+    """Map a prediction lag to its bucket name."""
+    for name, (lo, hi) in LAG_BUCKETS.items():
+        if lo <= lag <= hi:
+            return name
+    return 'long'
+
+
+def build_model_selection_table(gsa_sites, models,
+                                temporal_results, temporal_site, temporal_site_lag,
+                                cv_results, fold_site_metrics, fold_site_lag_metrics,
+                                customer_recommended):
+    """Hierarchical cascade model selection.
+
+    For each (site, lag_bucket), select the best model using the finest
+    granularity where we have enough CV folds to measure the temporal/random gap.
+
+    Cascade levels:
+        1. (site, lag_bucket) — most granular
+        2. (site)             — pooled across lags
+        3. customer-level     — existing global default
+
+    Parameters
+    ----------
+    gsa_sites : list of site identifiers
+    models : dict of {model_name: (oo_col, fc_col)}
+    temporal_results : dict {model_name: wmape} — customer-level temporal
+    temporal_site : dict {(gs, model_name): wmape}
+    temporal_site_lag : dict {(gs, lag_bucket, model_name): wmape}
+    cv_results : dict {model_name: {cv_mean, gap, ...}} — customer-level CV
+    fold_site_metrics : dict {(gs, model_name): [wmape_per_fold]}
+    fold_site_lag_metrics : dict {(gs, lb, model_name): [wmape_per_fold]}
+    customer_recommended : str — fallback model name
+
+    Returns
+    -------
+    selection : dict {(gsa_site, lag_bucket): (model_name, level, gap)}
+    """
+    # The two key contenders: OO-inclusive vs FC-only
+    oo_model = 'mOO + mFC'
+    fc_model = 'FC-only multi'
+    oo_probe = 'V8d (OO+FC)'  # Used to measure OO stationarity
+
+    selection = {}
+
+    for gs in gsa_sites:
+        for lb in LAG_BUCKETS:
+            # ---- Level 1: (site, lag_bucket) ----
+            probe_key = (gs, lb, oo_probe)
+            if (probe_key in temporal_site_lag
+                    and probe_key in fold_site_lag_metrics
+                    and len(fold_site_lag_metrics[probe_key]) >= MIN_FOLDS_FOR_GAP):
+                t_w = temporal_site_lag[probe_key]
+                cv_w = np.mean(fold_site_lag_metrics[probe_key])
+                gap = t_w - cv_w
+                if abs(gap) > OO_NONSTATIONARY_GAP:
+                    selection[(gs, lb)] = (fc_model, 'site+lag', gap)
+                else:
+                    # OO is stationary at this level — pick the better contender
+                    oo_tw = temporal_site_lag.get((gs, lb, oo_model), float('inf'))
+                    fc_tw = temporal_site_lag.get((gs, lb, fc_model), float('inf'))
+                    best = oo_model if oo_tw <= fc_tw else fc_model
+                    selection[(gs, lb)] = (best, 'site+lag', gap)
+                continue
+
+            # ---- Level 2: (site) ----
+            probe_skey = (gs, oo_probe)
+            if (probe_skey in temporal_site
+                    and probe_skey in fold_site_metrics
+                    and len(fold_site_metrics[probe_skey]) >= MIN_FOLDS_FOR_GAP):
+                t_w = temporal_site[probe_skey]
+                cv_w = np.mean(fold_site_metrics[probe_skey])
+                gap = t_w - cv_w
+                if abs(gap) > OO_NONSTATIONARY_GAP:
+                    selection[(gs, lb)] = (fc_model, 'site', gap)
+                else:
+                    oo_tw = temporal_site.get((gs, oo_model), float('inf'))
+                    fc_tw = temporal_site.get((gs, fc_model), float('inf'))
+                    best = oo_model if oo_tw <= fc_tw else fc_model
+                    selection[(gs, lb)] = (best, 'site', gap)
+                continue
+
+            # ---- Level 3: customer-level default ----
+            cust_gap = cv_results.get(oo_probe, {}).get('gap', 0)
+            selection[(gs, lb)] = (customer_recommended, 'customer', cust_gap)
+
+    return selection
+
+
 # ============================================================
 # PER-CUSTOMER PIPELINE
 # ============================================================
@@ -653,6 +744,30 @@ def run_customer_pipeline(cust_df, customer_name):
             fm_s = f"{vals.get('fm', np.nan):>6.1f}%" if 'fm' in vals else "    n/a"
             print(f"  {lag:>4d} | {d_s:>8s} | {dm_s:>8s} | {fm_s:>8s}")
 
+    # ---- Per-(site) and per-(site, lag_bucket) temporal metrics ----
+    temporal_site = {}       # {(gs, model_name): wmape}
+    temporal_site_lag = {}   # {(gs, lag_bucket, model_name): wmape}
+
+    for gs in gsa_sites:
+        sub_gs = test[m2 & (test['gsa_site'] == gs) & (test['Actual_Sales'] > 0)]
+        if len(sub_gs) == 0:
+            continue
+        for model_name in models:
+            v = sub_gs[sub_gs[model_name].notna()]
+            if len(v) > 0:
+                temporal_site[(gs, model_name)] = compute_wmape(
+                    v['Actual_Sales'].values, v[model_name].values)
+        for lb, (lo, hi) in LAG_BUCKETS.items():
+            sub_lb = sub_gs[(sub_gs['Prediction_Lag'] >= lo) &
+                            (sub_gs['Prediction_Lag'] <= hi)]
+            if len(sub_lb) == 0:
+                continue
+            for model_name in models:
+                v = sub_lb[sub_lb[model_name].notna()]
+                if len(v) > 0:
+                    temporal_site_lag[(gs, lb, model_name)] = compute_wmape(
+                        v['Actual_Sales'].values, v[model_name].values)
+
     # ---- K-Fold Random CV ----
     print(f"\n  {'=' * 80}")
     print(f"  K-FOLD RANDOM CV ({N_FOLDS} folds) — {customer_name}")
@@ -664,6 +779,8 @@ def run_customer_pipeline(cust_df, customer_name):
     fold_size = len(df) // N_FOLDS
 
     fold_metrics = {mn: [] for mn in models}
+    fold_site_metrics = {}       # {(gs, model_name): [wmape_per_fold]}
+    fold_site_lag_metrics = {}   # {(gs, lb, model_name): [wmape_per_fold]}
 
     for fold_i in range(N_FOLDS):
         fold_start = fold_i * fold_size
@@ -717,6 +834,34 @@ def run_customer_pipeline(cust_df, customer_name):
                 bias = compute_bias(v['Actual_Sales'].values, v[model_name].values)
                 fold_metrics[model_name].append({'wmape': wmape, 'bias': bias})
 
+        # Per-(site) and per-(site, lag_bucket) fold metrics
+        for gs in gsa_sites:
+            sub_gs = ts[ts['gsa_site'] == gs]
+            if len(sub_gs) == 0:
+                continue
+            for model_name in models:
+                v = sub_gs[sub_gs[model_name].notna()]
+                site_key = (gs, model_name)
+                if site_key not in fold_site_metrics:
+                    fold_site_metrics[site_key] = []
+                if len(v) > 0:
+                    fold_site_metrics[site_key].append(
+                        compute_wmape(v['Actual_Sales'].values, v[model_name].values))
+            for lb, (lo, hi) in LAG_BUCKETS.items():
+                sub_lb = sub_gs[(sub_gs['Prediction_Lag'] >= lo) &
+                                (sub_gs['Prediction_Lag'] <= hi)]
+                if len(sub_lb) == 0:
+                    continue
+                for model_name in models:
+                    v = sub_lb[sub_lb[model_name].notna()]
+                    sl_key = (gs, lb, model_name)
+                    if sl_key not in fold_site_lag_metrics:
+                        fold_site_lag_metrics[sl_key] = []
+                    if len(v) > 0:
+                        fold_site_lag_metrics[sl_key].append(
+                            compute_wmape(v['Actual_Sales'].values,
+                                          v[model_name].values))
+
         # Per-fold summary
         v8d_w = fold_metrics['V8d (OO+FC)'][-1]['wmape'] if fold_metrics['V8d (OO+FC)'] else 0
         fm_w = fold_metrics['FC-only multi'][-1]['wmape'] if fold_metrics['FC-only multi'] else 0
@@ -743,26 +888,80 @@ def run_customer_pipeline(cust_df, customer_name):
             print(f"  {model_name:>22s} | {np.mean(wmapes):>5.1f}% +/- {np.std(wmapes):>4.1f}% "
                   f"(bias {np.mean(biases):>+5.1f}%) | {t_wmape:>6.1f}% | {gap:>+4.1f}pp")
 
-    # ---- Auto-detect OO stationarity ----
+    # ---- Customer-level OO stationarity (used as fallback) ----
     oo_gap = cv_results.get('V8d (OO+FC)', {}).get('gap', 0)
     fc_gap = cv_results.get('FC-only multi', {}).get('gap', 0)
     oo_nonstationary = abs(oo_gap) > OO_NONSTATIONARY_GAP
 
-    print(f"\n  {'=' * 80}")
-    print(f"  AUTO-DETECTION — {customer_name}")
-    print(f"  {'=' * 80}")
-
     if oo_nonstationary:
-        print(f"  ** OO signal is NON-STATIONARY (temporal/random gap = {oo_gap:+.1f}pp)")
-        print(f"     Recommend: FC-only multi-vintage model")
-        recommended = 'FC-only multi'
+        customer_recommended = 'FC-only multi'
     else:
-        # Pick the model with lowest temporal WMAPE
         best_model = min(temporal_results, key=temporal_results.get)
-        print(f"  OO signal appears stationary (gap = {oo_gap:+.1f}pp)")
-        print(f"  Recommended model: {best_model} "
-              f"(temporal WMAPE = {temporal_results[best_model]:.1f}%)")
-        recommended = best_model
+        customer_recommended = best_model
+
+    # ---- Hierarchical model selection ----
+    selection_table = build_model_selection_table(
+        gsa_sites, models,
+        temporal_results, temporal_site, temporal_site_lag,
+        cv_results, fold_site_metrics, fold_site_lag_metrics,
+        customer_recommended)
+
+    print(f"\n  {'=' * 80}")
+    print(f"  HIERARCHICAL MODEL SELECTION — {customer_name}")
+    print(f"  {'=' * 80}")
+    print(f"  Customer-level OO gap: {oo_gap:+.1f}pp "
+          f"({'NON-STATIONARY' if oo_nonstationary else 'stationary'}) "
+          f"-> default: {customer_recommended}")
+
+    print(f"\n  {'Site':>25s} | {'Lag':>6s} | {'Model':>15s} | {'Level':>8s} | {'Gap':>8s}")
+    print(f"  {'-' * 72}")
+    for gs in gsa_sites:
+        for lb in LAG_BUCKETS:
+            model_name, level, gap = selection_table[(gs, lb)]
+            print(f"  {gs:>25s} | {lb:>6s} | {model_name:>15s} | {level:>8s} | {gap:>+6.1f}pp")
+
+    # ---- Apply selection to test set ----
+    test['selected'] = np.nan
+    for idx in test.index:
+        row = test.loc[idx]
+        gs = row['gsa_site']
+        lb = lag_to_bucket(row['Prediction_Lag'])
+        sel_model = selection_table.get((gs, lb), (customer_recommended, '', 0))[0]
+        if sel_model in test.columns and not np.isnan(row[sel_model]):
+            test.at[idx, 'selected'] = row[sel_model]
+
+    # Compute selected-model metrics
+    ts_sel = test[m2 & test['selected'].notna() & (test['Actual_Sales'] > 0)]
+    if len(ts_sel) > 0:
+        sel_wmape = compute_wmape(ts_sel['Actual_Sales'].values, ts_sel['selected'].values)
+        sel_bias = compute_bias(ts_sel['Actual_Sales'].values, ts_sel['selected'].values)
+        print(f"\n  Hierarchical-selected WMAPE: {sel_wmape:.1f}%  "
+              f"bias: {sel_bias:+.1f}%  N={len(ts_sel)}")
+
+        # Compare against uniform models
+        for lbl in ['mOO + mFC', 'FC-only multi']:
+            if lbl in temporal_results:
+                diff = sel_wmape - temporal_results[lbl]
+                print(f"    vs uniform {lbl}: {diff:+.1f}pp")
+
+    # Per-site selected breakdown
+    print(f"\n  Per-site WMAPE (hierarchical selected vs uniform models):")
+    print(f"  {'Site':>25s} | {'Selected':>10s} | {'mOO+mFC':>10s} | {'FC-multi':>10s} | {'N':>4s}")
+    print(f"  {'-' * 70}")
+    for gs in gsa_sites:
+        sub = test[m2 & (test['gsa_site'] == gs) & (test['Actual_Sales'] > 0)]
+        if len(sub) == 0:
+            continue
+        vals = {}
+        for lbl, mn in [('sel', 'selected'), ('mm', 'mOO + mFC'), ('fm', 'FC-only multi')]:
+            v = sub[sub[mn].notna()]
+            if len(v) > 0:
+                vals[lbl] = compute_wmape(v['Actual_Sales'].values, v[mn].values)
+        if vals:
+            s_s = f"{vals.get('sel', np.nan):>6.1f}%" if 'sel' in vals else "     n/a"
+            mm_s = f"{vals.get('mm', np.nan):>6.1f}%" if 'mm' in vals else "     n/a"
+            fm_s = f"{vals.get('fm', np.nan):>6.1f}%" if 'fm' in vals else "     n/a"
+            print(f"  {gs:>25s} | {s_s:>10s} | {mm_s:>10s} | {fm_s:>10s} | {len(sub):>4d}")
 
     # Per-fold detail
     print(f"\n  Per-fold WMAPE:")
@@ -785,7 +984,8 @@ def run_customer_pipeline(cust_df, customer_name):
         'temporal': temporal_results,
         'cv': cv_results,
         'oo_nonstationary': oo_nonstationary,
-        'recommended': recommended,
+        'customer_recommended': customer_recommended,
+        'selection_table': selection_table,
     }
 
 
@@ -850,19 +1050,21 @@ def main():
         print(f"{'=' * 100}")
 
         print(f"\n  {'Customer':>20s} | {'Rows':>6s} | {'Sites':>5s} | {'FC%':>4s} | "
-              f"{'Best Temporal':>14s} | {'Best CV':>10s} | {'OO ok?':>6s} | {'Recommended':>20s}")
+              f"{'Best Temporal':>14s} | {'OO ok?':>6s} | {'Default':>15s} | {'Cells':>5s}")
         print(f"  {'-' * 100}")
 
         for r in all_results:
             best_temp_name = min(r['temporal'], key=r['temporal'].get) if r['temporal'] else 'n/a'
             best_temp_val = r['temporal'].get(best_temp_name, float('nan'))
-            best_cv_name = min(r['cv'], key=lambda k: r['cv'][k]['cv_mean']) if r['cv'] else 'n/a'
-            best_cv_val = r['cv'].get(best_cv_name, {}).get('cv_mean', float('nan'))
             oo_ok = 'YES' if not r['oo_nonstationary'] else 'NO'
+            st = r.get('selection_table', {})
+            n_cells = len(st)
+            n_oo = sum(1 for m, _, _ in st.values() if m == 'mOO + mFC')
 
             print(f"  {r['customer']:>20s} | {r['n_rows']:>6d} | {r['n_sites']:>5d} | "
                   f"{r['fc_pct']:>3.0f}% | {best_temp_val:>5.1f}% ({best_temp_name[:8]:>8s}) | "
-                  f"{best_cv_val:>5.1f}% | {oo_ok:>6s} | {r['recommended']:>20s}")
+                  f"{oo_ok:>6s} | {r['customer_recommended']:>15s} | "
+                  f"{n_oo}/{n_cells}")
 
     print(f"\n\nDone!")
 
