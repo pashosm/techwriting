@@ -111,6 +111,74 @@ The progress model assumes orders are **uniformly distributed** across the order
 1. **Non-uniform ordering CDF**: Orders concentrate at the beginning of the window. A different CDF shape (e.g. beta distribution, or empirically estimated) could moderate the correction for lags near the boundary.
 2. **LT+OE affecting OO vs FC weighting**: Rather than correcting the OO curve itself, use the LT+OE shift to adjust how much weight we give OO vs FC in the final combination. When LT+OE drops significantly, the OO signal becomes less reliable at higher lags — the model should lean more on FC.
 3. **FC-primary architecture**: Given the random CV findings, explore models where FC is the dominant signal. OO could play a supporting role — e.g., used only at short lags (1–3) where its temporal drift is smallest, or used as a secondary input whose weight decays with OO-ratio instability.
+4. **Older vintage analysis**: The multi-vintage model currently weights all vintages by `1/lag^1.5`. Older vintages (high original lag) may carry different signal quality — worth examining whether a staleness cap or different weighting at very high lags improves results.
+
+## Multi-Vintage FC Architecture
+
+### The problem: wasted forecast information
+
+The original model treats each row `(Site, Reference_Month, Timeframe, Lag)` independently. When a row has `Has_Forecast=0`, it falls back to historical average — even though the **same target period** likely has a forecast from a different Reference_Month (a different "vintage" issued at a different lag).
+
+Customer 2 issues forecasts quarterly (~13 of 46 months). At the row level, only 16% have forecasts. But at the **target period** level, 95% have at least one forecast vintage. Customer 1 has 46% row-level coverage but similarly benefits from looking across vintages.
+
+### The fix: target-period-centric forecast lookup
+
+Instead of asking "does this row have a forecast?", the model now asks "what forecasts are available for this target period?"
+
+For each row to predict:
+1. **Look up** all forecasts for its target period `(Site, Target_Period_Start, Target_Period_End)` from the forecast registry
+2. **Filter** to causally-valid vintages (forecast's `Reference_Month` ≤ row's `Reference_Month`)
+3. **Apply curves** at each vintage's **original** `(site, tf, lag)` — the coverage/bias characteristics depend on when the forecast was made, not when we're predicting
+4. **Combine** multiple estimates with inverse-lag power weighting: `w = 1/lag^1.5` (recent forecasts get much more weight)
+5. **Use `best_vintage_lag`** for the FC lag penalty in `weighted_avg` — a row at lag=8 with a lag=1 vintage forecast should be trusted like a lag=1 forecast, not penalized for being at lag=8
+
+Key design choices:
+- **Temporal causality**: In temporal eval, only forecasts issued before the row's Reference_Month are used. In random CV, the registry is built from training fold only.
+- **Forecast values are dynamic**: Different vintages for the same target period have different Forecast_Values (forecasts improve closer to the target). This is real information, not duplication.
+- **Actual_Sales is constant**: All rows for a given target period share the same realized outcome. The different vintages give different predictions of this single truth.
+
+### Customer 1 Results
+
+| Model | Temporal | Random CV | Gap |
+|-------|----------|-----------|-----|
+| V8d (OO+FC flat) | 16.5% | 93.9% | -77.5pp |
+| **V8d + multi-FC** | **15.3%** | 62.3% | -47.0pp |
+| FC-only flat | 21.3% | 20.2% | +1.1pp |
+| **FC-only multi** | 19.9% | **13.4%** | +6.5pp |
+
+**V8d + multi-FC (15.3%)** is the first model variant to improve on V8d's 16.5% through a structural change alone — no new signals, no parameter tuning, just using forecast information that was already in the data but being ignored.
+
+Per-lag improvement (V8d+multi-FC vs V8d):
+
+| Lag | V8d | V8d+mFC | Gain | FC coverage |
+|-----|-----|---------|------|-------------|
+| 1 | 11.1% | 10.1% | -1.0pp | 210 rows |
+| 4 | 16.3% | 14.4% | -1.9pp | 150 rows |
+| 7 | 22.1% | 19.3% | -2.8pp | 90 rows |
+| 8 | 24.5% | 20.4% | **-4.1pp** | 75 rows |
+
+The improvement is largest at high lags (7-8) where the original model had no FC and relied entirely on OO or historical average. Multi-vintage provides real FC signal at these lags from forecasts issued in earlier months.
+
+Per-site: Site W drops from 12.4% to **9.8%** (-2.6pp), Site S from 15.8% to 14.6% (-1.2pp).
+
+**FC-only multi (13.4% random CV)** is the best unbiased FC result — better than temporal V8d. This demonstrates that the FC signal, when fully exploited across vintages, is extremely powerful.
+
+### Customer 2 Results
+
+| Model | Temporal | Random CV | Gap |
+|-------|----------|-----------|-----|
+| Single-vintage | 33.1% | 41.3% ± 0.7% | -8.2pp |
+| **Multi-vintage** | 37.0% | **37.7% ± 0.8%** | **-0.7pp** |
+
+The temporal/random gap collapses from **-8.2pp to -0.7pp**. This proves the single-vintage temporal result (33.1%) was artificially good — 78% of test rows fell through to historical averages, which leak future information in temporal splits. Multi-vintage replaces that leaked signal with real FC data, and the gap vanishes.
+
+FC coverage jumps from **14% to 53%** of test rows (513 → 2,010 rows). Vintage depth averages 2.0 forecasts per target period, max 4.
+
+Random CV bias improves from +44.6% to +32.2% — less reliance on the biased historical average fallback.
+
+### Key takeaway
+
+**Every customer's forecast data contains more signal than we were using.** The target-period-centric architecture extracts this signal by looking across Reference_Months for each target period. The approach is general — it works for both Customer 1 (monthly forecasts, 46% coverage) and Customer 2 (quarterly forecasts, 16% coverage) with the same code and hyperparameters.
 
 ## V7 Reference
 WMAPE = 8.8%, bias = +0.5%, account = 2.2%
