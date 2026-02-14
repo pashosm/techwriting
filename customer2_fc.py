@@ -225,7 +225,13 @@ def weighted_avg(test_df, train_df, t_months, fc_col='fc_implied_flat'):
                     row = results.loc[idx]
                     lag = row['Prediction_Lag']
                     has_fc = not np.isnan(row[fc_col]) and row[fc_col] > 0
-                    fc_f = max(0.3, 1.0 - 0.06*(lag-1)) if has_fc else 0
+                    # Use best_vintage_lag for FC penalty when using multi-vintage FC
+                    fc_lag = lag
+                    if has_fc and fc_col == 'fc_implied_multi' and 'best_vintage_lag' in results.columns:
+                        bvl = results.at[idx, 'best_vintage_lag']
+                        if not np.isnan(bvl):
+                            fc_lag = bvl
+                    fc_f = max(0.3, 1.0 - 0.06*(fc_lag-1)) if has_fc else 0
                     w_fc = (1/max(fc_mape, 0.01)) * fc_f if has_fc else 0
                     hv = hist.get((gs, tf), 0)
                     w_h = (1/0.5) * 0.1 * lag/12 if hv > 0 else 0
