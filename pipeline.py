@@ -40,13 +40,6 @@ MIN_FOLDS_FOR_GAP = 3      # Need at least this many folds with observations to 
 CI_LEVEL = 0.80            # Prediction interval coverage target
 MIN_OBS_CI = 5             # Minimum observations to compute quantiles at a granularity level
 
-# OO Refinement constants (V8m, V8n)
-ROLLING_WINDOW_MONTHS = 9  # Months of training data to use for rolling-window curves
-MIN_OBS_TREND = 5          # Minimum observations to fit a time trend
-MAX_TREND_RATIO = 5.0      # Cap extrapolated ratio to avoid runaway trends
-MIN_TREND_RATIO = 0.01     # Floor for extrapolated ratio
-LTOE_SHIFT_SENSITIVITY = 1.5  # Power for LT+OE shift dampening of OO weight
-
 # ============================================================
 # CORE FUNCTIONS
 # ============================================================
@@ -142,198 +135,6 @@ def build_flat_curves(train_df, ratio_col, start=None):
             flat[('FB', gs, lag)] = np.average(valid[ratio_col], weights=wts)
 
     return flat
-
-
-# ---- V8m: Rolling-Window OO Curves ----
-
-def build_rolling_curves(train_df, ratio_col, window_months=ROLLING_WINDOW_MONTHS,
-                         start=None):
-    """Build OO curves using only the most recent `window_months` of training data.
-
-    Addresses non-stationarity by restricting to recent data where LT+OE is
-    closer to the current regime. Falls back to full-history flat curves when
-    the rolling window has insufficient observations.
-
-    Returns dict: {(gsa_site, Timeframe, Prediction_Lag): value}
-    plus fallback keys {('FB', gsa_site, Prediction_Lag): value}.
-    """
-    td = train_df if start is None else train_df[train_df['Reference_Month'] >= start]
-    max_ref = td['Reference_Month'].max()
-    cutoff = max_ref - pd.DateOffset(months=window_months)
-    recent = td[td['Reference_Month'] >= cutoff]
-
-    rolling = {}
-
-    for (gs, tf, lag), grp in recent.groupby(['gsa_site', 'Timeframe', 'Prediction_Lag']):
-        valid = grp[grp[ratio_col].notna() & (grp[ratio_col] > 0) & (grp[ratio_col] < 10)]
-        if len(valid) < MIN_OBS_FLAT:
-            continue
-        days = (valid['Reference_Month'] - valid['Reference_Month'].min()).dt.days / 365
-        wts = (1 + days.values) ** RECENCY_POWER
-        rolling[(gs, tf, lag)] = np.average(valid[ratio_col], weights=wts)
-
-    # Fallback: pooled across timeframes (still from rolling window)
-    for (gs, lag), grp in recent.groupby(['gsa_site', 'Prediction_Lag']):
-        valid = grp[grp[ratio_col].notna() & (grp[ratio_col] > 0) & (grp[ratio_col] < 10)]
-        if len(valid) >= MIN_OBS_FLAT:
-            days = (valid['Reference_Month'] - valid['Reference_Month'].min()).dt.days / 365
-            wts = (1 + days.values) ** RECENCY_POWER
-            rolling[('FB', gs, lag)] = np.average(valid[ratio_col], weights=wts)
-
-    return rolling
-
-
-# ---- V8n: Trend-Extrapolated OO Curves ----
-
-def build_trend_curves(train_df, ratio_col, start=None):
-    """Build OO curves by fitting a linear time trend per cell and extrapolating.
-
-    For each (site, tf, lag) cell, fits: ratio = a + b * time_in_years
-    and extrapolates to the latest reference month + 1 month (the first test
-    month). Falls back to flat curve when trend is unstable or insufficient data.
-
-    Returns dict: {(gsa_site, Timeframe, Prediction_Lag): value}
-    plus fallback keys, and a companion dict of trend metadata.
-    """
-    td = train_df if start is None else train_df[train_df['Reference_Month'] >= start]
-    trend_curves = {}
-    trend_meta = {}
-    ref_time = td['Reference_Month'].max()
-
-    def _fit_cell(valid, ref_time):
-        """Fit trend on valid observations, extrapolate to ref_time + 1 month."""
-        time_years = (valid['Reference_Month'] - valid['Reference_Month'].min()).dt.days / 365
-        y = valid[ratio_col].values
-        wts = (1 + time_years.values) ** RECENCY_POWER
-
-        # Weighted OLS: ratio = alpha + beta * time
-        X = np.column_stack([np.ones(len(y)), time_years.values])
-        W = np.sqrt(wts)
-        Xw = X * W[:, None]
-        yw = y * W
-        try:
-            coef = np.linalg.lstsq(Xw, yw, rcond=None)[0]
-        except np.linalg.LinAlgError:
-            return None, None
-
-        alpha, beta = coef[0], coef[1]
-
-        # Extrapolate to 1 month beyond training end
-        extrap_years = (ref_time - valid['Reference_Month'].min()).dt.days.max() / 365 + 1/12
-        predicted = alpha + beta * extrap_years
-
-        # Constrain to reasonable range
-        predicted = np.clip(predicted, MIN_TREND_RATIO, MAX_TREND_RATIO)
-
-        # Also compute flat baseline for comparison
-        flat_val = np.average(y, weights=wts)
-
-        meta = {
-            'alpha': alpha, 'beta': beta,
-            'flat_val': flat_val,
-            'extrapolated': predicted,
-            'n_obs': len(y),
-            'time_span_years': time_years.max(),
-        }
-        return predicted, meta
-
-    for (gs, tf, lag), grp in td.groupby(['gsa_site', 'Timeframe', 'Prediction_Lag']):
-        valid = grp[grp[ratio_col].notna() & (grp[ratio_col] > 0) & (grp[ratio_col] < 10)]
-        if len(valid) < MIN_OBS_TREND:
-            continue
-        # Need at least some time span to fit a meaningful trend
-        time_span = (valid['Reference_Month'].max() - valid['Reference_Month'].min()).days / 365
-        if time_span < 0.5:
-            continue
-
-        val, meta = _fit_cell(valid, ref_time)
-        if val is not None:
-            trend_curves[(gs, tf, lag)] = val
-            trend_meta[(gs, tf, lag)] = meta
-
-    # Fallback: pooled across timeframes
-    for (gs, lag), grp in td.groupby(['gsa_site', 'Prediction_Lag']):
-        valid = grp[grp[ratio_col].notna() & (grp[ratio_col] > 0) & (grp[ratio_col] < 10)]
-        if len(valid) < MIN_OBS_TREND:
-            continue
-        time_span = (valid['Reference_Month'].max() - valid['Reference_Month'].min()).days / 365
-        if time_span < 0.5:
-            continue
-        val, meta = _fit_cell(valid, ref_time)
-        if val is not None:
-            trend_curves[('FB', gs, lag)] = val
-            trend_meta[('FB', gs, lag)] = meta
-
-    return trend_curves, trend_meta
-
-
-def apply_oo_curves(dset, curve_dict, flat_fallback=None):
-    """Apply OO curves (rolling or trend) with optional flat fallback.
-
-    Parameters
-    ----------
-    dset : DataFrame to add oo_implied column to
-    curve_dict : primary curve dictionary to look up
-    flat_fallback : optional fallback curve dict when primary misses
-
-    Returns column name and coverage count.
-    """
-    oo_impl = np.full(len(dset), np.nan)
-    n_primary = 0
-    n_fallback = 0
-
-    for i, (idx, row) in enumerate(dset.iterrows()):
-        gs, tf, lag = row['gsa_site'], row['Timeframe'], row['Prediction_Lag']
-
-        # Try primary curve
-        for key in [(gs, tf, lag), ('FB', gs, lag)]:
-            if key in curve_dict and curve_dict[key] > 0.001:
-                oo_impl[i] = row['Open_Orders'] / curve_dict[key]
-                n_primary += 1
-                break
-        else:
-            # Try flat fallback
-            if flat_fallback is not None:
-                for key in [(gs, tf, lag), ('FB', gs, lag)]:
-                    if key in flat_fallback and flat_fallback[key] > 0.001:
-                        oo_impl[i] = row['Open_Orders'] / flat_fallback[key]
-                        n_fallback += 1
-                        break
-
-    return np.maximum(oo_impl, 0), n_primary, n_fallback
-
-
-# ---- LT+OE Reference Computation ----
-
-def build_ltoe_reference(train_df):
-    """Compute reference (training-era) LT+OE per (site, tf, lag) cell.
-
-    Returns dict: {(gsa_site, Timeframe, Prediction_Lag): avg_ltoe}
-    plus fallback keys {('FB', gsa_site, Prediction_Lag): avg_ltoe}.
-    """
-    ref_ltoe = {}
-    for (gs, tf, lag), grp in train_df.groupby(['gsa_site', 'Timeframe', 'Prediction_Lag']):
-        valid = grp[(grp['Avg_Weighted_Lead_Time'] > 0) |
-                     (grp['Avg_Weighted_Order_Earliness'] > 0)]
-        if len(valid) >= MIN_OBS_FLAT:
-            days = (valid['Reference_Month'] - valid['Reference_Month'].min()).dt.days / 365
-            wts = (1 + days.values) ** RECENCY_POWER
-            ref_ltoe[(gs, tf, lag)] = np.average(
-                valid['Avg_Weighted_Lead_Time'] + valid['Avg_Weighted_Order_Earliness'],
-                weights=wts)
-
-    # Fallback: pooled across timeframes
-    for (gs, lag), grp in train_df.groupby(['gsa_site', 'Prediction_Lag']):
-        valid = grp[(grp['Avg_Weighted_Lead_Time'] > 0) |
-                     (grp['Avg_Weighted_Order_Earliness'] > 0)]
-        if len(valid) >= MIN_OBS_FLAT:
-            days = (valid['Reference_Month'] - valid['Reference_Month'].min()).dt.days / 365
-            wts = (1 + days.values) ** RECENCY_POWER
-            ref_ltoe[('FB', gs, lag)] = np.average(
-                valid['Avg_Weighted_Lead_Time'] + valid['Avg_Weighted_Order_Earliness'],
-                weights=wts)
-
-    return ref_ltoe
 
 
 def apply_flat_curves(dset, oo_f, cov_f, bias_f):
@@ -572,8 +373,7 @@ def apply_fc_debias(dset, fc_debias):
 # ---- Weighted Average Blending ----
 
 def weighted_avg(test_df, train_df, test_months, gsa_sites_list,
-                 oo_col='oo_implied_flat', fc_col='fc_implied_flat',
-                 ref_ltoe=None):
+                 oo_col='oo_implied_flat', fc_col='fc_implied_flat'):
     """Blend OO signal, FC signal, and historical average into a final prediction.
 
     Parameters
@@ -583,9 +383,6 @@ def weighted_avg(test_df, train_df, test_months, gsa_sites_list,
     gsa_sites_list : list of gsa_site values for this customer
     oo_col : column name for OO implied actual (use 'oo_none' to disable OO)
     fc_col : column name for FC implied actual
-    ref_ltoe : optional dict of reference LT+OE per (site, tf, lag) cell.
-        When provided, OO weight is dampened based on how much LT+OE has
-        shifted from training. Bigger shift = less trust in OO.
     """
     results = test_df.copy()
     results['pred'] = np.nan
@@ -644,22 +441,6 @@ def weighted_avg(test_df, train_df, test_months, gsa_sites_list,
 
                     # OO lag factor
                     oo_f = max(0.3, 1.0 - 0.06 * (lag - 1)) if has_oo else 0
-
-                    # LT+OE shift dampening: reduce OO weight when LT+OE has dropped
-                    if ref_ltoe is not None and has_oo:
-                        lt_oe_cur = (row['Avg_Weighted_Lead_Time'] +
-                                     row['Avg_Weighted_Order_Earliness'])
-                        ref_val = None
-                        for key in [(gs, tf, lag), ('FB', gs, lag)]:
-                            if key in ref_ltoe:
-                                ref_val = ref_ltoe[key]
-                                break
-                        if (ref_val is not None and ref_val > 0.5
-                                and lt_oe_cur > 0.5):
-                            # shift_ratio < 1 when LT+OE has dropped
-                            shift_ratio = min(lt_oe_cur / ref_val, 1.0)
-                            # Dampen OO weight: shift_ratio^sensitivity
-                            oo_f *= shift_ratio ** LTOE_SHIFT_SENSITIVITY
 
                     # FC lag factor — use best_vintage_lag when multi-vintage
                     fc_lag = lag
