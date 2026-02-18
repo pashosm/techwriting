@@ -10,6 +10,9 @@ This project builds demand forecasting models that combine two signals — **Ope
 |------|---------|
 | `aging_v8g.py` | Customer 1 full pipeline: curve building, signal quality, V8d–V8k model variants, multi-vintage FC, random CV |
 | `customer2_fc.py` | Customer 2 FC-only pipeline: multi-vintage FC, temporal eval, random CV |
+| `oo_normalization.py` | Power-CDF OO normalization experiment: alpha estimation, normalized/damped curves, both customers |
+| `subquarter_decomp.py` | Sub-quarter decomposition experiment: bottom-up TF=3 predictions for TF=6/9/12, both customers |
+| `fc_tuning.py` | FC parameter tuning experiment: systematic sweep of vintage weighting, lag decay, staleness caps, curve recency |
 | `Dummy Training Data Customer 1 Try 2 11-Feb-2026.csv` | Customer 1 data (~13,500 rows) |
 | `Dummy_Training_Data_Customer_2_12-Feb-26.csv` | Customer 2 data (~19,000 rows) |
 
@@ -338,10 +341,324 @@ The intervals communicate two things simultaneously:
 
 ---
 
-## Current Understanding & Open Questions
+## Power-CDF OO Normalization (Negative Result)
 
-### Why V8k over-corrects for Sites S and T
-The progress model assumes orders are **uniformly distributed** across the ordering window. In reality, orders concentrate earlier in the window, especially for longer timeframes. This means the correction at lags near the boundary may be too aggressive.
+### Motivation
+
+V8k's uniform CDF correction assumed `alpha=1` (orders distributed uniformly across the ordering window). Data exploration revealed that the ordering curve actually follows a **power law** `OO_ratio ~ progress^alpha` with **site-specific alpha**, explaining why V8k over-corrected Sites S and T.
+
+### Alpha Estimation
+
+Estimated via weighted log-log OLS regression: `log(OO_ratio) = alpha × log(progress) + c`, with recency weighting (`RECENCY_POWER=2`), clipped to [0.3, 4.0].
+
+#### Customer 1 — Per-site alpha
+
+| Site | Alpha | N obs | Interpretation |
+|------|-------|-------|----------------|
+| Site D | 1.05 | 441 | Nearly uniform ordering |
+| Site S | 1.65 | 496 | Moderately back-loaded |
+| Site T | 2.30 | 369 | Heavily back-loaded |
+| Site W | 2.48 | 485 | Heavily back-loaded |
+
+#### Customer 1 — Per-(site, timeframe) alpha
+
+Alpha increases with timeframe for most sites, suggesting more back-loaded ordering at longer horizons:
+
+| Site | TF3 | TF6 | TF9 | TF12 |
+|------|-----|-----|-----|------|
+| Site D | 1.00 | 0.94 | 1.14 | 1.10 |
+| Site S | 1.25 | 1.60 | 2.04 | 2.00 |
+| Site T | 1.56 | 2.14 | 2.66 | 3.06 |
+| Site W | 2.13 | 2.69 | 2.84 | 2.98 |
+
+#### Customer 2 — Per-site alpha
+
+| Site | Alpha | N obs |
+|------|-------|-------|
+| Other-PS EMEA | 0.30 | 175 |
+| Site H | 1.03 | 630 |
+| Site B | 2.34 | 629 |
+
+### Approach: Normalized OO Curves
+
+```
+progress = max(ε, 1 - lag / (LT + OE))
+OO_ratio_norm = OO_ratio / progress^alpha       (training: normalized ratio)
+implied_actual = OO / (curve_norm × progress^alpha)  (prediction)
+```
+
+Curves built on the normalized ratio per `(site, tf, lag)` with recency weighting. Also tested a **damped variant** that blends between normalized and flat using a smoothstep function of progress, to avoid noise amplification at high lags.
+
+### Variants tested
+
+| Variant | Description |
+|---------|-------------|
+| NormS | Per-site alpha, normalized curves |
+| NormST | Per-(site, timeframe) alpha, normalized curves |
+| DampS | Per-site alpha, damped correction on flat curves |
+| DampST | Per-(site, tf) alpha, damped correction on flat curves |
+
+Each combined with both flat FC and multi-vintage FC.
+
+### Results
+
+#### Customer 1 (temporal, months 2+)
+
+| Model | WMAPE | Bias |
+|-------|-------|------|
+| **V8d + mFC** | **18.4%** | -0.4% |
+| NormS + mFC | 20.1% | +2.9% |
+| NormST + mFC | 20.2% | +3.1% |
+| DampS + mFC | 21.9% | +5.3% |
+| DampST + mFC | 22.0% | +5.3% |
+| FC-only multi | 23.0% | +4.3% |
+
+#### Customer 2 (temporal, months 2+)
+
+| Model | WMAPE | Bias |
+|-------|-------|------|
+| **FC-only multi** | **38.2%** | +12.5% |
+| V8d + mFC | 42.2% | +3.1% |
+| NormS + mFC | 45.0% | +5.5% |
+| DampS + mFC | 46.9% | +10.3% |
+| DampST + mFC | 47.6% | +10.7% |
+
+### Stationarity improvement (positive)
+
+Despite not improving temporal accuracy, normalization dramatically improved stationarity as measured by the temporal-vs-random CV gap:
+
+| Model | Customer 1 Gap | Customer 2 Gap |
+|-------|---------------|---------------|
+| V8d + mFC | 76.6pp | 66.7pp |
+| NormS + mFC | 26.1pp | 22.4pp |
+| NormST + mFC | 23.8pp | 26.3pp |
+
+### Why normalization didn't improve temporal accuracy
+
+1. **Noise amplification at high lags**: Dividing by `progress^alpha` when progress is small (high lags, short LT+OE) amplifies noise. Customer 1 lag 12: V8d 78.7% → NormS 108.6%.
+2. **Recency weighting already handles drift**: Flat curves with `RECENCY_POWER=2` naturally downweight old observations, providing implicit adaptation to LT+OE changes. The normalization disrupts this already-adequate calibration.
+3. **Damped correction doesn't help**: Blending normalized and flat based on progress level didn't find a sweet spot — the correction either applied too aggressively (short lags where flat was fine) or not enough (long lags where noise dominates).
+
+### Key takeaway
+
+The power-CDF model correctly captures the physics of ordering (site-specific alpha, progress-dependent visibility), and it successfully makes the OO signal more stationary. But the flat curves' recency weighting already compensates for LT+OE drift in the temporal evaluation window, and normalization introduces noise that outweighs the stationarity benefit. **This is a case where the theoretically correct model is outperformed by a simpler adaptive approach.**
+
+The experiment is documented in `oo_normalization.py`.
+
+---
+
+## Sub-Quarter Decomposition (Negative Result)
+
+### Motivation
+
+A TF=12 target period can be decomposed into four non-overlapping TF=3 sub-quarters. Each sub-quarter exists as its own TF=3 row at the same Reference_Month but at progressively higher effective lags (`eff_lag = parent_lag + 3*k`). The hypothesis: predicting each sub-quarter independently using TF=3 curves and summing could be more accurate than a single TF=12 prediction, because TF=3 curves may be better calibrated and the decomposition naturally captures front-loaded vs back-loaded ordering patterns.
+
+### Data verification
+
+**Perfect additivity confirmed** for both customers: TF=3 Actual_Sales and Open_Orders sum exactly to TF=6/9/12 values (100% match for all fully-matched rows).
+
+Sub-quarter availability depends on effective lag (max lag in data = 12):
+
+| Parent TF | Full coverage (all subs) | Partial coverage |
+|-----------|------------------------|-----------------|
+| TF=6 | Parent lag 1–9 | Lag 10–12: 1 of 2 |
+| TF=9 | Parent lag 1–6 | Lag 7–9: 2 of 3 |
+| TF=12 | Parent lag 1–3 | Lag 4+: progressively fewer |
+
+### Variants tested
+
+- **BU-OO (all-or-nothing)**: Only predict when ALL sub-quarters have data and curve coverage. Falls back to per-TF flat curve otherwise.
+- **BU-OO (shares)**: Scale available sub-quarter predictions by historical share to fill missing quarters. Historical shares computed per (site, parent_TF, sub-quarter index).
+- Combined with both flat FC and multi-vintage FC.
+
+### Results
+
+#### Customer 1 (temporal, months 2+)
+
+| Model | WMAPE | Bias |
+|-------|-------|------|
+| **V8d + mFC** | **18.4%** | +36.6% |
+| BU-OO(sh) + mFC | 18.6% | +33.4% |
+| BU-OO + mFC | 19.4% | +35.8% |
+| FC-only multi | 23.0% | +46.0% |
+
+Per-TF breakdown:
+
+| TF | V8d + mFC | BU-OO + mFC | BU-OO(sh) + mFC |
+|----|-----------|-------------|-----------------|
+| 3 | 23.4% | 23.4% | 23.4% |
+| 6 | 20.1% | 21.0% | **19.9%** |
+| 9 | 15.7% | 17.0% | **15.5%** |
+| 12 | **12.8%** | 14.7% | 14.9% |
+
+#### Customer 2 (temporal, months 2+)
+
+| Model | WMAPE | Bias |
+|-------|-------|------|
+| **FC-only multi** | **38.2%** | +24.1% |
+| V8d + mFC | 42.2% | +36.1% |
+| BU-OO + mFC | 42.3% | +41.2% |
+| BU-OO(sh) + mFC | 44.2% | +41.2% |
+
+Per-TF breakdown:
+
+| TF | V8d + mFC | BU-OO + mFC | BU-OO(sh) + mFC |
+|----|-----------|-------------|-----------------|
+| 3 | 47.8% | 47.8% | 47.8% |
+| 6 | 42.8% | 43.4% | 45.1% |
+| 9 | 40.3% | 40.4% | 42.3% |
+| 12 | 37.4% | **36.8%** | 41.4% |
+
+### Stationarity improvement
+
+Bottom-up OO is more stationary than flat OO (smaller temporal-vs-random CV gap):
+
+| Model | Customer 1 Gap | Customer 2 Gap |
+|-------|---------------|---------------|
+| V8d + mFC | -45.2pp | -25.8pp |
+| BU-OO + mFC | -33.3pp | -12.7pp |
+| FC-only multi | +7.0pp | +1.5pp |
+
+### Historical sub-quarter shares
+
+Most sites have fairly uniform quarterly shares within longer TFs:
+
+| Site | TF=12 Q1 | Q2 | Q3 | Q4 | Pattern |
+|------|----------|-----|-----|-----|---------|
+| Site W | 23.9% | 24.6% | 25.3% | 26.2% | ~Even |
+| Site S | 24.6% | 24.1% | 24.9% | 26.5% | ~Even |
+| Site T | 24.9% | 24.1% | 23.8% | 24.4% | ~Even |
+| Site A | 5.5% | 25.2% | 34.2% | 68.3% | Highly seasonal |
+
+With most sites showing near-even shares, there is limited front/back-loading signal for the decomposition to exploit.
+
+### Why decomposition didn't improve temporal accuracy
+
+1. **Error accumulation**: Summing 2–4 noisy TF=3 predictions introduces more variance than a single per-TF prediction. OO signal WMAPE: flat 43.0% vs BU 44.9% (Customer 1).
+2. **High effective lags add noise**: Later sub-quarters have effective lags of 7–12+, where TF=3 OO curves are least reliable.
+3. **Even quarterly shares**: Most sites split evenly across quarters (23–27% each), so decomposition provides minimal information gain over the aggregate.
+4. **Shares scaling**: Pro-rating partial decompositions (shares mode) amplifies errors from the sub-quarters that are available.
+5. **Marginal TF=6/9 improvement**: BU(shares) shows tiny gains for Customer 1 TF=6 (-0.2pp) and TF=9 (-0.2pp), but these are offset by TF=12 degradation.
+
+### Key takeaway
+
+Bottom-up decomposition is structurally sound (perfect additivity) and produces a more stationary OO signal. But the noise from summing multiple TF=3 predictions outweighs any benefit from capturing quarterly ordering patterns. **The per-TF flat curves already capture timeframe-specific dynamics more efficiently than reconstructing them from sub-quarters.** The one exception — Site A's extreme seasonality (Q1=5.5%, Q4=68.3%) — suggests decomposition could help for highly seasonal sites, but there aren't enough such sites to move the overall metric.
+
+The experiment is documented in `subquarter_decomp.py`.
+
+---
+
+## FC Parameter Tuning (Positive Result)
+
+### Motivation
+
+Three OO-focused experiments (power-CDF normalization, sub-quarter decomposition, cross-site correlation) all produced negative results. FC is the dominant signal: FC-only multi beats all OO-containing models for Customer 2 (38.2% vs 42.2%), and for Customer 1 FC carries most of the prediction value. Five FC parameters were set heuristically and never tuned:
+
+| Parameter | Default | What it does |
+|-----------|---------|-------------|
+| `VINTAGE_RECENCY_POWER` | 1.5 | Controls vintage combination weighting: `weight = 1/lag^power` |
+| FC lag decay coefficient | 0.06 | FC reliability penalty in blend: `fc_f = max(floor, 1 - coeff*(lag-1))` |
+| FC lag decay floor | 0.3 | Minimum FC reliability factor |
+| Vintage staleness cap | None | Whether to exclude vintages beyond a maximum lag |
+| FC curve RECENCY_POWER | 2 | Recency weighting when building FC coverage/bias curves |
+
+### Approach
+
+Systematic sequential sweep: optimize one parameter dimension at a time, carry the best forward to the next sweep. Final combination validated via K-fold random CV.
+
+### Results
+
+#### Customer 1 (temporal, months 2+)
+
+| Model | WMAPE | Bias | vs Default |
+|-------|-------|------|-----------|
+| V8d + mFC (default) | 18.4% | +36.6% | --- |
+| **V8d + mFC (tuned)** | **17.3%** | +36.4% | **-1.0pp** |
+| FC-only multi (default) | 23.0% | +46.0% | --- |
+| FC-only multi (tuned) | 21.2% | +44.2% | -1.8pp |
+
+Per-TF improvement (V8d+mFC):
+
+| TF | Default | Tuned | Diff |
+|----|---------|-------|------|
+| 3 | 23.4% | 22.5% | -0.9pp |
+| 6 | 20.1% | 19.1% | -1.0pp |
+| 9 | 15.7% | 14.4% | -1.2pp |
+| 12 | 12.8% | 11.8% | -1.0pp |
+
+Per-lag improvement (V8d+mFC):
+
+| Lag | Default | Tuned | Diff |
+|-----|---------|-------|------|
+| 1 | 14.7% | 12.5% | -2.2pp |
+| 4 | 17.3% | 16.4% | -1.0pp |
+| 8 | 24.1% | 22.8% | -1.2pp |
+| 12 | 38.9% | 39.2% | +0.3pp |
+
+Improvement is consistent across all TFs and most lags. Largest gains at lag 1 (-2.2pp) where FC signal is strongest.
+
+#### Customer 2 (temporal, months 2+)
+
+| Model | WMAPE | Bias | vs Default |
+|-------|-------|------|-----------|
+| V8d + mFC (default) | 42.2% | +36.1% | --- |
+| **V8d + mFC (tuned)** | **40.8%** | +36.7% | **-1.4pp** |
+| FC-only multi (default) | 38.2% | +24.1% | --- |
+| **FC-only multi (tuned)** | **36.2%** | +24.9% | **-2.0pp** |
+
+Per-TF improvement (V8d+mFC):
+
+| TF | Default | Tuned | Diff |
+|----|---------|-------|------|
+| 3 | 47.8% | 47.0% | -0.8pp |
+| 6 | 42.8% | 41.8% | -1.0pp |
+| 9 | 40.3% | 38.5% | -1.8pp |
+| 12 | 37.4% | 35.1% | -2.3pp |
+
+Improvement grows with TF — longer timeframes benefit most because they have more vintages to combine.
+
+### Best parameters found
+
+Both customers converged on the same direction for each parameter:
+
+| Parameter | Default | Cust 1 Best | Cust 2 Best | Direction |
+|-----------|---------|-------------|-------------|-----------|
+| VINTAGE_RECENCY_POWER | 1.5 | **0.5** | **0.5** | Lower = more equal weighting |
+| FC lag decay coeff | 0.06 | 0.06 | 0.06 | No change |
+| FC lag decay floor | 0.3 | 0.3 | **0.5** | Slightly higher for Cust 2 |
+| Vintage staleness cap | None | None | None | No cap needed |
+| FC curve RECENCY_POWER | 2 | **3.0** | **3.0** | Higher = more emphasis on recent data |
+
+### Parameter sweep findings
+
+**VINTAGE_RECENCY_POWER (1.5 -> 0.5)**: The most impactful parameter. Lower power means more equal weighting across vintages — older forecasts contain real signal and shouldn't be discounted as aggressively. At power=0.5, a lag=3 vintage gets 58% of lag=1's weight (vs 19% at power=1.5). Both customers improve monotonically as power decreases. Clear signal: the default was too aggressive at discounting older vintages.
+
+**FC lag decay (coeff/floor)**: The 2D heatmap is mostly flat — the FC lag decay coefficient and floor have little effect when multi-vintage is already adjusting the effective lag via `best_vintage_lag`. The default values (0.06/0.3) are near-optimal for both customers. This makes sense: with multi-vintage FC, most rows already have a nearby vintage, so the lag penalty rarely applies at full force.
+
+**Vintage staleness cap**: No cap is better. Removing old vintages strictly hurts — even distant forecasts contribute useful information when weighted properly. Capping at 3 vintages degrades V8d+mFC by +16.5pp (Cust 1) and +7.5pp (Cust 2).
+
+**FC curve RECENCY_POWER (2 -> 3)**: Higher recency power in curve building emphasizes the most recent training observations more. Both customers improve monotonically from 1.0 to 3.0. This makes sense: FC coverage and bias patterns are drifting over time, and putting more weight on recent observations produces more relevant curves for the test period.
+
+### K-fold random CV validation
+
+| Config | Cust 1 CV | Cust 1 Temporal | Cust 2 CV | Cust 2 Temporal |
+|--------|-----------|-----------------|-----------|-----------------|
+| V8d+mFC (default) | 63.6% | 18.4% | 68.0% | 42.2% |
+| V8d+mFC (tuned) | 64.1% | 17.3% | 67.8% | 40.8% |
+| FC-only (default) | 16.0% | 23.0% | 36.8% | 38.2% |
+| FC-only (tuned) | 15.9% | 21.2% | 37.2% | 36.2% |
+
+Tuned parameters show equivalent CV performance to defaults (within noise), confirming the temporal improvement is not overfitting. Customer 2 FC-only (tuned) actually reduces the temporal-CV gap from +1.5pp to -1.0pp, suggesting tuning aligns the model better with stationary behavior.
+
+### Key takeaway
+
+**FC parameter tuning delivers the first genuine accuracy improvement** across all experiments. The two impactful changes — lower vintage power (0.5 vs 1.5) and higher curve recency (3 vs 2) — both point in the same direction: **trust all vintage information more equally, but calibrate curves on the most recent data.** This is consistent with the finding that FC is a nearly stationary signal (unlike OO): older vintages are still informative, but the coverage/bias curves should adapt quickly to recent patterns.
+
+The experiment is documented in `fc_tuning.py`.
+
+---
+
+## Current Understanding & Open Questions
 
 ### LT+OE shifts by site (train → test)
 | Site | LT+OE train | LT+OE test | Shift |
@@ -353,7 +670,8 @@ The progress model assumes orders are **uniformly distributed** across the order
 | Site J | 13.0 | 10.2 | -2.8 |
 
 ### Ideas to explore
-1. **Non-uniform ordering CDF**: A different CDF shape (e.g. beta distribution, or empirically estimated) could moderate the correction for lags near the boundary.
-2. **LT+OE affecting OO vs FC weighting**: Use the LT+OE shift to adjust how much weight we give OO vs FC. When LT+OE drops significantly, lean more on FC.
-3. **FC-primary architecture**: Models where FC is the dominant signal. OO could play a supporting role only at short lags (1–3) where its temporal drift is smallest.
-4. **Older vintage analysis**: The multi-vintage model currently weights all vintages by `1/lag^1.5`. Older vintages (high original lag) may carry different signal quality — worth examining whether a staleness cap or different weighting at very high lags improves results.
+1. **LT+OE affecting OO vs FC weighting**: Use the LT+OE shift to adjust how much weight we give OO vs FC. When LT+OE drops significantly, lean more on FC.
+2. **FC-primary architecture**: Models where FC is the dominant signal. OO could play a supporting role only at short lags (1–3) where its temporal drift is smallest.
+3. ~~**Older vintage analysis**~~: **Done** — FC parameter tuning (vintage_power=0.5, no staleness cap) showed older vintages are valuable and should not be discounted aggressively.
+4. ~~**OO lag restriction**~~: **Deprioritized** — existing mechanisms already cover most of this. The lag decay factor (`oo_f = max(0.3, 1.0 - 0.06*(lag-1))`) already reduces OO weight to 30% at high lags, MAPE-based blending further penalizes OO where FC-multi has better accuracy, and the `OO_NONSTATIONARY_GAP` stationarity check already switches to FC-only for the worst offenders. The remaining sites where OO survives at high lags are the less non-stationary ones, where the residual 0.3 floor weight is least likely to cause harm. A hard cutoff would only replace the 0.3 floor with 0.0 — marginal benefit unless specific evidence emerges of high-lag OO damage in sites that pass the stationarity check.
+5. **Apply tuned FC parameters to pipeline.py**: Update the production pipeline with the validated parameter improvements (VINTAGE_RECENCY_POWER=0.5, FC RECENCY_POWER=3). The lag decay params were already near-optimal.
