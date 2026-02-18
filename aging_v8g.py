@@ -1147,6 +1147,14 @@ test['v8d_multi'] = weighted_avg(test, train, test_months, 'oo_implied_flat', 'f
 print("  Running FC-only multi-vintage...")
 test['fc_only_multi'] = weighted_avg(test, train, test_months, 'oo_none', 'fc_implied_multi')
 
+# LT+OE visibility-adjusted models (down-weight OO when LT+OE has dropped)
+print("  Running V8d + visibility (LT+OE-informed OO weighting)...")
+test['v8d_vis'] = weighted_avg(test, train, test_months, 'oo_implied_flat', 'fc_implied_flat',
+                                visibility_adj=True, ref_ltoe=ref_lt_oe)
+print("  Running V8d + multi-FC + visibility...")
+test['v8d_multi_vis'] = weighted_avg(test, train, test_months, 'oo_implied_flat', 'fc_implied_multi',
+                                      visibility_adj=True, ref_ltoe=ref_lt_oe)
+
 # V8g conditioned
 print("  Running V8g (conditioned curves)...")
 test['v8g'] = weighted_avg(test, train, test_months, 'oo_implied', 'fc_implied')
@@ -1195,7 +1203,8 @@ print(f"  {'V8d (flat, p=0)':>20s} | {w:>5.1f}% | {b:>+5.1f}% | {r2:>.3f} | {aw:
 
 # FC-only and FC-debiased
 for label, col in [('FC-only', 'fc_only'), ('FC-only debiased', 'fc_debiased'),
-                    ('V8d+multi-FC', 'v8d_multi'), ('FC-only multi', 'fc_only_multi')]:
+                    ('V8d+multi-FC', 'v8d_multi'), ('FC-only multi', 'fc_only_multi'),
+                    ('V8d+vis', 'v8d_vis'), ('V8d+mFC+vis', 'v8d_multi_vis')]:
     ts = test[m2 & test[col].notna() & test['gsa_site'].isin(clean_sites)]
     y, p = ts['Actual_Sales'].values, ts[col].values
     w = np.sum(np.abs(y-p))/np.sum(y)*100
@@ -1222,36 +1231,35 @@ for pv in P_VALUES:
         aw = np.sum(np.abs(by_m['Actual_Sales']-by_m['pr']))/np.sum(by_m['Actual_Sales'])*100
         print(f"  {label:>20s} | {w:>5.1f}% | {b:>+5.1f}% | {r2:>.3f} | {aw:>4.1f}%")
 
-# Per-site: V8d vs FC-only vs FC-debiased
-print(f"\n  Per-site (months 2+) — V8d vs Multi-vintage models:")
-print(f"  {'Site':>20s} | {'V8d':>12s} | {'V8d+mFC':>12s} | {'FC-multi':>12s} | {'d-mfc':>6s} | {'d-fcm':>6s}")
-print("  " + "-" * 85)
+# Per-site: V8d vs visibility-adjusted models
+print(f"\n  Per-site (months 2+) — V8d vs Multi-vintage vs Visibility-adjusted:")
+print(f"  {'Site':>20s} | {'V8d':>12s} | {'V8d+mFC':>12s} | {'V8d+vis':>12s} | {'mFC+vis':>12s} | {'d-vis':>6s} | {'dm-mv':>6s}")
+print("  " + "-" * 105)
 for gs in sorted(clean_sites):
     site = gs.split('|')[1]
     sub = test[m2 & (test['gsa_site']==gs) & (test['Actual_Sales']>0)]
     vals = {}
-    for lbl, c in [('d','v8d'),('dm','v8d_multi'),('fm','fc_only_multi')]:
+    for lbl, c in [('d','v8d'),('dm','v8d_multi'),('dv','v8d_vis'),('mv','v8d_multi_vis')]:
         v = sub[sub[c].notna()]
         if len(v) > 0:
             vals[lbl+'w'] = np.sum(np.abs(v['Actual_Sales']-v[c]))/np.sum(v['Actual_Sales'])*100
             vals[lbl+'b'] = np.mean((v[c]-v['Actual_Sales'])/v['Actual_Sales'])*100
-    if all(k in vals for k in ['dw','dmw','fmw']):
-        print(f"  {site:>20s} | {vals['dw']:>5.1f}%{vals['db']:>+5.0f}% | {vals['dmw']:>5.1f}%{vals['dmb']:>+5.0f}% | {vals['fmw']:>5.1f}%{vals['fmb']:>+5.0f}% | {vals['dmw']-vals['dw']:>+4.1f} | {vals['fmw']-vals['dw']:>+4.1f}")
+    if all(k in vals for k in ['dw','dmw','dvw','mvw']):
+        print(f"  {site:>20s} | {vals['dw']:>5.1f}%{vals['db']:>+5.0f}% | {vals['dmw']:>5.1f}%{vals['dmb']:>+5.0f}% | {vals['dvw']:>5.1f}%{vals['dvb']:>+5.0f}% | {vals['mvw']:>5.1f}%{vals['mvb']:>+5.0f}% | {vals['dvw']-vals['dw']:>+4.1f} | {vals['mvw']-vals['dmw']:>+4.1f}")
 
-# Per-lag: V8d vs multi-vintage models
-print(f"\n  WMAPE by lag — V8d vs Multi-vintage models:")
-print(f"  {'Lag':>4s} | {'V8d':>8s} | {'V8d+mFC':>8s} | {'FC-multi':>8s} | {'d-mfc':>6s} | {'FCcov':>5s}")
-print("  " + "-" * 55)
+# Per-lag: V8d vs visibility-adjusted models
+print(f"\n  WMAPE by lag — V8d vs Visibility-adjusted:")
+print(f"  {'Lag':>4s} | {'V8d':>8s} | {'V8d+mFC':>8s} | {'V8d+vis':>8s} | {'mFC+vis':>8s} | {'d-vis':>6s} | {'dm-mv':>6s}")
+print("  " + "-" * 70)
 for lag in sorted(test['Prediction_Lag'].unique()):
     sub = test[m2 & (test['Prediction_Lag']==lag) & (test['Actual_Sales']>0) & test['gsa_site'].isin(clean_sites)]
     vals = {}
-    for lbl, c in [('d','v8d'),('dm','v8d_multi'),('fm','fc_only_multi')]:
+    for lbl, c in [('d','v8d'),('dm','v8d_multi'),('dv','v8d_vis'),('mv','v8d_multi_vis')]:
         v = sub[sub[c].notna()]
         if len(v) > 0:
             vals[lbl] = np.sum(np.abs(v['Actual_Sales']-v[c]))/np.sum(v['Actual_Sales'])*100
-    n_multi = sub['fc_implied_multi'].notna().sum()
-    if all(k in vals for k in ['d','dm','fm']):
-        print(f"  {lag:>4d} | {vals['d']:>6.1f}% | {vals['dm']:>6.1f}% | {vals['fm']:>6.1f}% | {vals['dm']-vals['d']:>+4.1f} | {n_multi:>5d}")
+    if all(k in vals for k in ['d','dm','dv','mv']):
+        print(f"  {lag:>4d} | {vals['d']:>6.1f}% | {vals['dm']:>6.1f}% | {vals['dv']:>6.1f}% | {vals['mv']:>6.1f}% | {vals['dv']-vals['d']:>+4.1f} | {vals['mv']-vals['dm']:>+4.1f}")
 
 # ============================================================
 # K-FOLD RANDOM CV: Drift vs Noise Diagnostic
@@ -1268,7 +1276,8 @@ indices = np.arange(len(df))
 np.random.shuffle(indices)
 fold_size = len(df) // N_FOLDS
 
-fold_metrics = {model: [] for model in ['V8d', 'FC-only', 'FC-debiased', 'V8d+multi-FC', 'FC-only multi']}
+fold_metrics = {model: [] for model in ['V8d', 'FC-only', 'FC-debiased', 'V8d+multi-FC', 'FC-only multi',
+                                         'V8d+vis', 'V8d+mFC+vis']}
 
 for fold_i in range(N_FOLDS):
     fold_start = fold_i * fold_size
@@ -1331,6 +1340,23 @@ for fold_i in range(N_FOLDS):
     apply_fc_multi_vintage(f_train, cov_f, bias_f, registry_fold, causality='fold')
     apply_fc_multi_vintage(f_test, cov_f, bias_f, registry_fold, causality='fold')
 
+    # Build ref_lt_oe from fold training data
+    fold_ref_ltoe = {}
+    for (gs, tf, lag), grp in f_train.groupby(['gsa_site', 'Timeframe', 'Prediction_Lag']):
+        valid = grp[(grp['Avg_Weighted_Lead_Time'] > 0) | (grp['Avg_Weighted_Order_Earliness'] > 0)]
+        if len(valid) >= MIN_OBS_FLAT:
+            days = (valid['Reference_Month'] - valid['Reference_Month'].min()).dt.days / 365
+            wts = (1 + days.values) ** RECENCY_POWER
+            fold_ref_ltoe[(gs, tf, lag)] = np.average(
+                valid['Avg_Weighted_Lead_Time'] + valid['Avg_Weighted_Order_Earliness'], weights=wts)
+    for (gs, lag), grp in f_train.groupby(['gsa_site', 'Prediction_Lag']):
+        valid = grp[(grp['Avg_Weighted_Lead_Time'] > 0) | (grp['Avg_Weighted_Order_Earliness'] > 0)]
+        if len(valid) >= MIN_OBS_FLAT:
+            days = (valid['Reference_Month'] - valid['Reference_Month'].min()).dt.days / 365
+            wts = (1 + days.values) ** RECENCY_POWER
+            fold_ref_ltoe[('FB', gs, lag)] = np.average(
+                valid['Avg_Weighted_Lead_Time'] + valid['Avg_Weighted_Order_Earliness'], weights=wts)
+
     # Run models
     f_test_months = sorted(f_test['Reference_Month'].unique())
     f_test['v8d'] = weighted_avg(f_test, f_train, f_test_months, 'oo_implied_flat', 'fc_implied_flat')
@@ -1338,11 +1364,16 @@ for fold_i in range(N_FOLDS):
     f_test['fc_debiased'] = weighted_avg(f_test, f_train, f_test_months, 'oo_none', 'fc_implied_debiased')
     f_test['v8d_multi'] = weighted_avg(f_test, f_train, f_test_months, 'oo_implied_flat', 'fc_implied_multi')
     f_test['fc_only_multi'] = weighted_avg(f_test, f_train, f_test_months, 'oo_none', 'fc_implied_multi')
+    f_test['v8d_vis'] = weighted_avg(f_test, f_train, f_test_months, 'oo_implied_flat', 'fc_implied_flat',
+                                      visibility_adj=True, ref_ltoe=fold_ref_ltoe)
+    f_test['v8d_multi_vis'] = weighted_avg(f_test, f_train, f_test_months, 'oo_implied_flat', 'fc_implied_multi',
+                                            visibility_adj=True, ref_ltoe=fold_ref_ltoe)
 
     # Compute metrics for each model (clean sites only)
     ts = f_test[f_test['gsa_site'].isin(clean_sites) & (f_test['Actual_Sales'] > 0)]
     for model_name, col in [('V8d', 'v8d'), ('FC-only', 'fc_only'), ('FC-debiased', 'fc_debiased'),
-                             ('V8d+multi-FC', 'v8d_multi'), ('FC-only multi', 'fc_only_multi')]:
+                             ('V8d+multi-FC', 'v8d_multi'), ('FC-only multi', 'fc_only_multi'),
+                             ('V8d+vis', 'v8d_vis'), ('V8d+mFC+vis', 'v8d_multi_vis')]:
         v = ts[ts[col].notna()]
         if len(v) > 0:
             y, p = v['Actual_Sales'].values, v[col].values
@@ -1353,7 +1384,9 @@ for fold_i in range(N_FOLDS):
 
     print(f"  Fold {fold_i+1}: V8d={fold_metrics['V8d'][-1]['wmape']:.1f}%  "
           f"V8d+mFC={fold_metrics['V8d+multi-FC'][-1]['wmape']:.1f}%  "
-          f"FC-multi={fold_metrics['FC-only multi'][-1]['wmape']:.1f}%")
+          f"FC-multi={fold_metrics['FC-only multi'][-1]['wmape']:.1f}%  "
+          f"V8d+vis={fold_metrics['V8d+vis'][-1]['wmape']:.1f}%  "
+          f"mFC+vis={fold_metrics['V8d+mFC+vis'][-1]['wmape']:.1f}%")
 
 # Summary: Random CV vs Temporal
 print(f"\n  {'':>20s} | {'Random CV (mean±std)':>25s} | {'Temporal':>10s} | {'Gap':>6s}")
@@ -1363,13 +1396,15 @@ print("  " + "-" * 70)
 temporal_metrics = {}
 ts_temp = test[m2 & test['gsa_site'].isin(clean_sites) & (test['Actual_Sales'] > 0)]
 for model_name, col in [('V8d', 'v8d'), ('FC-only', 'fc_only'), ('FC-debiased', 'fc_debiased'),
-                         ('V8d+multi-FC', 'v8d_multi'), ('FC-only multi', 'fc_only_multi')]:
+                         ('V8d+multi-FC', 'v8d_multi'), ('FC-only multi', 'fc_only_multi'),
+                         ('V8d+vis', 'v8d_vis'), ('V8d+mFC+vis', 'v8d_multi_vis')]:
     v = ts_temp[ts_temp[col].notna()]
     if len(v) > 0:
         y, p = v['Actual_Sales'].values, v[col].values
         temporal_metrics[model_name] = np.sum(np.abs(y - p)) / np.sum(y) * 100
 
-for model_name in ['V8d', 'FC-only', 'FC-debiased', 'V8d+multi-FC', 'FC-only multi']:
+for model_name in ['V8d', 'FC-only', 'FC-debiased', 'V8d+multi-FC', 'FC-only multi',
+                    'V8d+vis', 'V8d+mFC+vis']:
     wmapes = [m['wmape'] for m in fold_metrics[model_name]]
     biases = [m['bias'] for m in fold_metrics[model_name]]
     r2s = [m['r2'] for m in fold_metrics[model_name]]
@@ -1379,13 +1414,15 @@ for model_name in ['V8d', 'FC-only', 'FC-debiased', 'V8d+multi-FC', 'FC-only mul
 
 # Per-fold detail
 print(f"\n  Per-fold WMAPE:")
-print(f"  {'Fold':>6s} | {'V8d':>8s} | {'V8d+mFC':>8s} | {'FC-multi':>8s} | {'V8d bias':>9s}")
-print("  " + "-" * 55)
+print(f"  {'Fold':>6s} | {'V8d':>8s} | {'V8d+mFC':>8s} | {'FC-multi':>8s} | {'V8d+vis':>8s} | {'mFC+vis':>8s} | {'V8d bias':>9s}")
+print("  " + "-" * 75)
 for i in range(N_FOLDS):
     v8d_m = fold_metrics['V8d'][i]
     v8dm_m = fold_metrics['V8d+multi-FC'][i]
     fcm_m = fold_metrics['FC-only multi'][i]
-    print(f"  {'F'+str(i+1):>6s} | {v8d_m['wmape']:>6.1f}% | {v8dm_m['wmape']:>6.1f}% | {fcm_m['wmape']:>6.1f}% | {v8d_m['bias']:>+7.1f}%")
+    vis_m = fold_metrics['V8d+vis'][i]
+    mvis_m = fold_metrics['V8d+mFC+vis'][i]
+    print(f"  {'F'+str(i+1):>6s} | {v8d_m['wmape']:>6.1f}% | {v8dm_m['wmape']:>6.1f}% | {fcm_m['wmape']:>6.1f}% | {vis_m['wmape']:>6.1f}% | {mvis_m['wmape']:>6.1f}% | {v8d_m['bias']:>+7.1f}%")
 
 # Per-lag comparison: random CV (pooled across folds) vs temporal
 # Re-run one fold to get per-lag detail (use full random CV pool)

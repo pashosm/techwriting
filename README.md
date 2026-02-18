@@ -352,8 +352,60 @@ The progress model assumes orders are **uniformly distributed** across the order
 | Site W | 13.3 | 9.4 | -3.9 |
 | Site J | 13.0 | 10.2 | -2.8 |
 
+### LT+OE Visibility-Adjusted OO/FC Weighting (Tested)
+
+**Idea**: When LT+OE drops from training to test, OO becomes less reliable (fewer orders visible at a given lag). Down-weight OO in the blend using:
+
+```
+visibility = clip(prog_cur / prog_ref, 0.1, 1.0)
+oo_f = oo_f × visibility
+```
+
+Where `prog = max(0.05, 1 - lag / LT_OE)`. This only reduces OO weight (capped at 1.0), never increases it, so FC gains relative share in the blend.
+
+#### Results
+
+| Model | WMAPE | Bias | R² | Acct |
+|-------|-------|------|-----|------|
+| V8d (baseline) | 16.5% | -2.9% | 0.948 | 2.5% |
+| **V8d+vis** | **16.5%** | **-2.1%** | 0.948 | **2.4%** |
+| V8d+multi-FC | 15.3% | -1.9% | 0.960 | 2.5% |
+| **V8d+mFC+vis** | **15.3%** | **-1.2%** | 0.960 | 2.6% |
+
+Per-site impact:
+
+| Site | LT+OE shift | V8d → V8d+vis | V8d+mFC → mFC+vis |
+|------|-------------|---------------|---------------------|
+| Site D | -4.7 | -1.4pp | -0.9pp |
+| Site J | -2.8 | -0.5pp | -0.6pp |
+| Site S | -6.5 | +0.4pp | +0.2pp |
+| Site T | -4.9 | +0.0pp | +0.2pp |
+| Site W | -3.9 | +0.0pp | +0.1pp |
+
+Per-lag impact (V8d+vis vs V8d):
+
+| Lag | V8d | V8d+vis | Delta |
+|-----|-----|---------|-------|
+| 3 | 15.2% | 15.0% | -0.2pp |
+| 4 | 16.3% | 15.9% | -0.4pp |
+| 5 | 16.8% | 16.5% | -0.3pp |
+| 8 | 24.5% | 25.0% | +0.5pp |
+| 12 | 34.1% | 33.1% | -1.0pp |
+
+Random CV: V8d+vis = 94.4% vs V8d = 94.9% (negligible — no systematic LT+OE shift exists under random shuffling).
+
+#### Interpretation
+
+**The visibility adjustment provides marginal improvement.** Bias improves consistently (V8d: -2.9% → -2.1%, V8d+mFC: -1.9% → -1.2%), confirming the mechanism is directionally correct — OO overstates demand when LT+OE drops, and reducing OO weight corrects this. But WMAPE doesn't improve because:
+
+1. **FC already dominates the blend.** The inverse-MAPE weighting (`w = 1/MAPE × lag_factor`) naturally gives FC much higher weight than OO (FC MAPE ~23% vs OO MAPE ~43%). The visibility adjustment reduces an already-small OO contribution.
+2. **Diminishing returns.** The lag-decay formula `max(0.3, 1-0.06*(lag-1))` already penalizes both signals at high lags. Multiplying OO's weight by another factor < 1 barely changes the blend outcome.
+3. **Sites S and T don't benefit.** Despite having the largest LT+OE drops (-6.5 and -4.9), these sites don't improve. Their OO signal is actually reasonable (19.5% and 27.4% WMAPE) — the problem isn't OO weight in the blend, but OO *curve calibration* (the flat curve itself is stale).
+
+**Verdict**: The LT+OE visibility weighting is a valid bias correction but not a meaningful accuracy improvement. The lever is too weak — by the time we reach the blend, FC already controls the prediction. The real opportunity is either improving OO curves themselves (ideas 1, 3) or better exploiting FC (idea 4).
+
 ### Ideas to explore
 1. **Non-uniform ordering CDF**: A different CDF shape (e.g. beta distribution, or empirically estimated) could moderate the correction for lags near the boundary.
-2. **LT+OE affecting OO vs FC weighting**: Use the LT+OE shift to adjust how much weight we give OO vs FC. When LT+OE drops significantly, lean more on FC.
+2. ~~**LT+OE affecting OO vs FC weighting**~~: Tested above. Marginal bias improvement only.
 3. **FC-primary architecture**: Models where FC is the dominant signal. OO could play a supporting role only at short lags (1–3) where its temporal drift is smallest.
 4. **Older vintage analysis**: The multi-vintage model currently weights all vintages by `1/lag^1.5`. Older vintages (high original lag) may carry different signal quality — worth examining whether a staleness cap or different weighting at very high lags improves results.
