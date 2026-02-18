@@ -1055,7 +1055,7 @@ if len(cells) > 0:
 # WEIGHTED AVERAGE COMBINATION
 # ============================================================
 def weighted_avg(test_df, train_df, test_months, oo_col='oo_implied', fc_col='fc_implied',
-                 visibility_adj=False, ref_ltoe=None):
+                 visibility_adj=False, ref_ltoe=None, oo_max_lag=None, oo_decay=0.06):
     results = test_df.copy()
     results['pred'] = np.nan
     hist = {}
@@ -1086,8 +1086,10 @@ def weighted_avg(test_df, train_df, test_months, oo_col='oo_implied', fc_col='fc
                     row = results.loc[idx]
                     lag = row['Prediction_Lag']
                     has_oo = not np.isnan(row[oo_col]) and row[oo_col]>0
+                    if has_oo and oo_max_lag is not None and lag > oo_max_lag:
+                        has_oo = False  # FC-primary: suppress OO beyond cutoff lag
                     has_fc = not np.isnan(row[fc_col]) and row[fc_col]>0
-                    oo_f = max(0.3, 1.0-0.06*(lag-1)) if has_oo else 0
+                    oo_f = max(0.0 if oo_max_lag else 0.3, 1.0-oo_decay*(lag-1)) if has_oo else 0
                     # Use best_vintage_lag for FC penalty when using multi-vintage FC
                     fc_lag = lag
                     if has_fc and fc_col == 'fc_implied_multi' and 'best_vintage_lag' in results.columns:
@@ -1154,6 +1156,24 @@ test['v8d_vis'] = weighted_avg(test, train, test_months, 'oo_implied_flat', 'fc_
 print("  Running V8d + multi-FC + visibility...")
 test['v8d_multi_vis'] = weighted_avg(test, train, test_months, 'oo_implied_flat', 'fc_implied_multi',
                                       visibility_adj=True, ref_ltoe=ref_lt_oe)
+
+# FC-primary architecture: OO cutoff sweep + steeper decay
+print("  Running FC-primary models (OO cutoff sweep)...")
+for max_lag in [1, 2, 3, 4, 5]:
+    col = f'fcp_L{max_lag}'
+    test[col] = weighted_avg(test, train, test_months, 'oo_implied_flat', 'fc_implied_flat',
+                              oo_max_lag=max_lag)
+    col_m = f'fcp_L{max_lag}_m'
+    test[col_m] = weighted_avg(test, train, test_months, 'oo_implied_flat', 'fc_implied_multi',
+                                oo_max_lag=max_lag)
+print("  Running FC-primary models (steeper OO decay)...")
+for decay in [0.10, 0.15, 0.20, 0.30]:
+    col = f'fcp_d{int(decay*100)}'
+    test[col] = weighted_avg(test, train, test_months, 'oo_implied_flat', 'fc_implied_flat',
+                              oo_decay=decay)
+    col_m = f'fcp_d{int(decay*100)}_m'
+    test[col_m] = weighted_avg(test, train, test_months, 'oo_implied_flat', 'fc_implied_multi',
+                                oo_decay=decay)
 
 # V8g conditioned
 print("  Running V8g (conditioned curves)...")
@@ -1230,6 +1250,77 @@ for pv in P_VALUES:
         by_m['pr'] = tf12.groupby('Reference_Month').apply(lambda g: test.loc[g.index, col].sum()).values
         aw = np.sum(np.abs(by_m['Actual_Sales']-by_m['pr']))/np.sum(by_m['Actual_Sales'])*100
         print(f"  {label:>20s} | {w:>5.1f}% | {b:>+5.1f}% | {r2:>.3f} | {aw:>4.1f}%")
+
+# FC-primary architecture results
+print(f"\n  FC-Primary Architecture — OO Cutoff Sweep:")
+print(f"  {'Model':>20s} | {'WMAPE':>7s} | {'Bias':>7s} | {'R²':>6s} | {'Acct':>6s}")
+print("  " + "-" * 60)
+for max_lag in [1, 2, 3, 4, 5]:
+    for suffix, label_sfx in [('', ' flat'), ('_m', ' +mFC')]:
+        col = f'fcp_L{max_lag}{suffix}'
+        label = f'OO≤{max_lag}{label_sfx}'
+        ts = test[m2 & test[col].notna() & test['gsa_site'].isin(clean_sites)]
+        y, p = ts['Actual_Sales'].values, ts[col].values
+        w_val = np.sum(np.abs(y-p))/np.sum(y)*100
+        b_val = np.mean((p-y)/y)*100
+        r2_val = 1 - np.sum((y-p)**2)/np.sum((y-np.mean(y))**2)
+        tf12 = ts[(ts['Timeframe']==12)&(ts['Prediction_Lag']==1)]
+        by_m = tf12.groupby('Reference_Month').agg({'Actual_Sales':'sum'})
+        by_m['pr'] = tf12.groupby('Reference_Month').apply(lambda g: test.loc[g.index, col].sum()).values
+        aw_val = np.sum(np.abs(by_m['Actual_Sales']-by_m['pr']))/np.sum(by_m['Actual_Sales'])*100
+        print(f"  {label:>20s} | {w_val:>5.1f}% | {b_val:>+5.1f}% | {r2_val:>.3f} | {aw_val:>4.1f}%")
+
+print(f"\n  FC-Primary Architecture — OO Decay Rate Sweep:")
+print(f"  {'Model':>20s} | {'WMAPE':>7s} | {'Bias':>7s} | {'R²':>6s} | {'Acct':>6s}")
+print("  " + "-" * 60)
+for decay in [0.06, 0.10, 0.15, 0.20, 0.30]:
+    for suffix, label_sfx in [('', ' flat'), ('_m', ' +mFC')]:
+        if decay == 0.06:
+            col = 'v8d' if suffix == '' else 'v8d_multi'
+            label = f'd=0.06 (base){label_sfx}'
+        else:
+            col = f'fcp_d{int(decay*100)}{suffix}'
+            label = f'd={decay:.2f}{label_sfx}'
+        ts = test[m2 & test[col].notna() & test['gsa_site'].isin(clean_sites)]
+        y, p = ts['Actual_Sales'].values, ts[col].values
+        w_val = np.sum(np.abs(y-p))/np.sum(y)*100
+        b_val = np.mean((p-y)/y)*100
+        r2_val = 1 - np.sum((y-p)**2)/np.sum((y-np.mean(y))**2)
+        tf12 = ts[(ts['Timeframe']==12)&(ts['Prediction_Lag']==1)]
+        by_m = tf12.groupby('Reference_Month').agg({'Actual_Sales':'sum'})
+        by_m['pr'] = tf12.groupby('Reference_Month').apply(lambda g: test.loc[g.index, col].sum()).values
+        aw_val = np.sum(np.abs(by_m['Actual_Sales']-by_m['pr']))/np.sum(by_m['Actual_Sales'])*100
+        print(f"  {label:>20s} | {w_val:>5.1f}% | {b_val:>+5.1f}% | {r2_val:>.3f} | {aw_val:>4.1f}%")
+
+# Per-site detail for best FC-primary variant (determined after sweep)
+print(f"\n  FC-Primary Per-site — OO Cutoff Sweep (+mFC):")
+print(f"  {'Site':>20s} | {'V8d+mFC':>12s} | {'OO≤1':>12s} | {'OO≤2':>12s} | {'OO≤3':>12s} | {'FC-only':>12s}")
+print("  " + "-" * 85)
+for gs in sorted(clean_sites):
+    site = gs.split('|')[1]
+    sub = test[m2 & (test['gsa_site']==gs) & (test['Actual_Sales']>0)]
+    vals = {}
+    for lbl, c in [('dm','v8d_multi'),('L1','fcp_L1_m'),('L2','fcp_L2_m'),('L3','fcp_L3_m'),('fo','fc_only_multi')]:
+        v = sub[sub[c].notna()]
+        if len(v) > 0:
+            vals[lbl+'w'] = np.sum(np.abs(v['Actual_Sales']-v[c]))/np.sum(v['Actual_Sales'])*100
+            vals[lbl+'b'] = np.mean((v[c]-v['Actual_Sales'])/v['Actual_Sales'])*100
+    if all(k in vals for k in ['dmw','L1w','L2w','L3w','fow']):
+        print(f"  {site:>20s} | {vals['dmw']:>5.1f}%{vals['dmb']:>+5.0f}% | {vals['L1w']:>5.1f}%{vals['L1b']:>+5.0f}% | {vals['L2w']:>5.1f}%{vals['L2b']:>+5.0f}% | {vals['L3w']:>5.1f}%{vals['L3b']:>+5.0f}% | {vals['fow']:>5.1f}%{vals['fob']:>+5.0f}%")
+
+# Per-lag detail for best FC-primary variants
+print(f"\n  FC-Primary WMAPE by lag — OO Cutoff Sweep (+mFC):")
+print(f"  {'Lag':>4s} | {'V8d+mFC':>8s} | {'OO≤1':>8s} | {'OO≤2':>8s} | {'OO≤3':>8s} | {'FC-only':>8s}")
+print("  " + "-" * 55)
+for lag in sorted(test['Prediction_Lag'].unique()):
+    sub = test[m2 & (test['Prediction_Lag']==lag) & (test['Actual_Sales']>0) & test['gsa_site'].isin(clean_sites)]
+    vals = {}
+    for lbl, c in [('dm','v8d_multi'),('L1','fcp_L1_m'),('L2','fcp_L2_m'),('L3','fcp_L3_m'),('fo','fc_only_multi')]:
+        v = sub[sub[c].notna()]
+        if len(v) > 0:
+            vals[lbl] = np.sum(np.abs(v['Actual_Sales']-v[c]))/np.sum(v['Actual_Sales'])*100
+    if all(k in vals for k in ['dm','L1','L2','L3','fo']):
+        print(f"  {lag:>4d} | {vals['dm']:>6.1f}% | {vals['L1']:>6.1f}% | {vals['L2']:>6.1f}% | {vals['L3']:>6.1f}% | {vals['fo']:>6.1f}%")
 
 # Per-site: V8d vs visibility-adjusted models
 print(f"\n  Per-site (months 2+) — V8d vs Multi-vintage vs Visibility-adjusted:")

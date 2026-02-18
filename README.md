@@ -402,10 +402,85 @@ Random CV: V8d+vis = 94.4% vs V8d = 94.9% (negligible — no systematic LT+OE sh
 2. **Diminishing returns.** The lag-decay formula `max(0.3, 1-0.06*(lag-1))` already penalizes both signals at high lags. Multiplying OO's weight by another factor < 1 barely changes the blend outcome.
 3. **Sites S and T don't benefit.** Despite having the largest LT+OE drops (-6.5 and -4.9), these sites don't improve. Their OO signal is actually reasonable (19.5% and 27.4% WMAPE) — the problem isn't OO weight in the blend, but OO *curve calibration* (the flat curve itself is stale).
 
-**Verdict**: The LT+OE visibility weighting is a valid bias correction but not a meaningful accuracy improvement. The lever is too weak — by the time we reach the blend, FC already controls the prediction. The real opportunity is either improving OO curves themselves (ideas 1, 3) or better exploiting FC (idea 4).
+**Verdict**: The LT+OE visibility weighting is a valid bias correction but not a meaningful accuracy improvement. The lever is too weak — by the time we reach the blend, FC already controls the prediction.
+
+---
+
+### FC-Primary Architecture (Tested)
+
+**Idea**: Make FC the dominant signal, with OO restricted to short lags (1–3) where its temporal drift is smallest. Two approaches tested:
+
+1. **Hard OO cutoff**: Zero out OO for `lag > N` (sweep N = 1, 2, 3, 4, 5)
+2. **Steeper OO decay**: Replace the standard `oo_f = max(0.3, 1-0.06*(lag-1))` with faster decay rates (0.10, 0.15, 0.20, 0.30 per lag)
+
+#### Results — OO Cutoff Sweep (with multi-vintage FC)
+
+| Model | WMAPE | Bias | R² | Acct |
+|-------|-------|------|-----|------|
+| V8d+mFC (no cutoff) | **15.3%** | -1.9% | 0.960 | 2.5% |
+| OO≤5 +mFC | 16.9% | +1.6% | 0.947 | 2.5% |
+| OO≤4 +mFC | 17.3% | +3.5% | 0.944 | 2.5% |
+| OO≤3 +mFC | 17.9% | +5.0% | 0.941 | 2.5% |
+| OO≤2 +mFC | 18.4% | +5.3% | 0.938 | 2.5% |
+| OO≤1 +mFC | 19.1% | +5.4% | 0.934 | 2.5% |
+| FC-only multi | 19.9% | +4.9% | 0.930 | 8.1% |
+
+Every cutoff degrades WMAPE. Even keeping OO only at lags ≤5 costs +1.6pp.
+
+Per-site detail (+mFC):
+
+| Site | V8d+mFC | OO≤1 | OO≤3 | FC-only |
+|------|---------|------|------|---------|
+| Site W | **9.8%** | 14.4% | 13.7% | 14.7% |
+| Site S | **14.6%** | 20.0% | 18.6% | 21.1% |
+| Site T | **19.2%** | 36.2% | 28.1% | 40.4% |
+| Site J | 20.8% | **16.1%** | 17.7% | **15.9%** |
+| Site D | 37.5% | 36.5% | **34.6%** | 38.8% |
+
+Site J actually *improves* without OO (its OO MAPE is 64.5% — extremely noisy). But Sites W, S, and T all degrade substantially, with Site T collapsing from 19.2% to 28-36%.
+
+Per-lag detail (+mFC):
+
+| Lag | V8d+mFC | OO≤1 | OO≤3 | FC-only |
+|-----|---------|------|------|---------|
+| 1 | **10.1%** | **10.1%** | **10.1%** | 14.5% |
+| 2 | **11.5%** | 15.6% | **11.5%** | 15.6% |
+| 3 | **13.7%** | 17.3% | **13.7%** | 17.3% |
+| 4 | **14.4%** | 19.0% | 19.0% | 19.0% |
+| 8 | **20.4%** | 26.7% | 26.7% | 26.7% |
+| 12 | **35.0%** | 37.5% | 37.5% | 37.5% |
+
+OO adds 3-6pp of value at every lag. Once OO is removed at a given lag, that lag collapses to FC-only performance.
+
+#### Results — OO Decay Rate Sweep (with multi-vintage FC)
+
+| Decay rate | WMAPE | Bias | R² |
+|-----------|-------|------|-----|
+| 0.06 (baseline) | **15.3%** | -1.9% | 0.960 |
+| 0.10 | 15.4% | -0.7% | 0.959 |
+| 0.15 | 15.5% | **+0.2%** | 0.958 |
+| 0.20 | 15.6% | +0.6% | 0.958 |
+| 0.30 | 15.7% | +0.9% | 0.957 |
+
+Steeper decay costs 0.1-0.4pp WMAPE but moves bias toward zero. At `d=0.15`, bias reaches +0.2% (nearly optimal). This suggests the baseline decay rate (0.06) slightly over-weights OO at high lags, causing the -1.9% negative bias.
+
+#### Interpretation
+
+**The FC-primary hypothesis is wrong for this data.** Despite OO's much higher MAPE (~43% vs ~23% for FC), it adds significant **diversification** value at all lags. The mechanism is bias cancellation:
+
+- **OO bias**: Systematically negative (-18% to -6% across lags) — OO understates demand
+- **FC bias**: Systematically positive (+6% to +33% across lags) — FC overstates demand
+
+When blended, these opposite biases partially cancel, producing the low -1.9% overall bias. Removing OO unmasks FC's positive bias (+5% for cutoff models, +4.9% for FC-only).
+
+The inverse-MAPE weighting mechanism (`w = 1/MAPE`) already handles the accuracy-vs-diversification tradeoff well. FC gets ~2x the weight of OO at lag 1 (due to lower MAPE) and even more at higher lags. The current blend is approximately optimal.
+
+**Verdict**: OO is not just noise — it provides critical bias counterbalance to FC. The best available model remains V8d+multi-FC at 15.3% WMAPE. The only actionable finding is that a slightly steeper OO decay (d=0.10–0.15) could reduce bias from -1.9% to near zero at negligible WMAPE cost (+0.1–0.2pp).
+
+---
 
 ### Ideas to explore
 1. **Non-uniform ordering CDF**: A different CDF shape (e.g. beta distribution, or empirically estimated) could moderate the correction for lags near the boundary.
 2. ~~**LT+OE affecting OO vs FC weighting**~~: Tested above. Marginal bias improvement only.
-3. **FC-primary architecture**: Models where FC is the dominant signal. OO could play a supporting role only at short lags (1–3) where its temporal drift is smallest.
+3. ~~**FC-primary architecture**~~: Tested above. OO provides critical bias diversification; removing it degrades accuracy.
 4. **Older vintage analysis**: The multi-vintage model currently weights all vintages by `1/lag^1.5`. Older vintages (high original lag) may carry different signal quality — worth examining whether a staleness cap or different weighting at very high lags improves results.
