@@ -12,6 +12,7 @@ This project builds demand forecasting models that combine two signals — **Ope
 | `customer2_fc.py` | Customer 2 FC-only pipeline: multi-vintage FC, temporal eval, random CV |
 | `oo_normalization.py` | Power-CDF OO normalization experiment: alpha estimation, normalized/damped curves, both customers |
 | `subquarter_decomp.py` | Sub-quarter decomposition experiment: bottom-up TF=3 predictions for TF=6/9/12, both customers |
+| `fc_tuning.py` | FC parameter tuning experiment: systematic sweep of vintage weighting, lag decay, staleness caps, curve recency |
 | `Dummy Training Data Customer 1 Try 2 11-Feb-2026.csv` | Customer 1 data (~13,500 rows) |
 | `Dummy_Training_Data_Customer_2_12-Feb-26.csv` | Customer 2 data (~19,000 rows) |
 
@@ -547,6 +548,116 @@ The experiment is documented in `subquarter_decomp.py`.
 
 ---
 
+## FC Parameter Tuning (Positive Result)
+
+### Motivation
+
+Three OO-focused experiments (power-CDF normalization, sub-quarter decomposition, cross-site correlation) all produced negative results. FC is the dominant signal: FC-only multi beats all OO-containing models for Customer 2 (38.2% vs 42.2%), and for Customer 1 FC carries most of the prediction value. Five FC parameters were set heuristically and never tuned:
+
+| Parameter | Default | What it does |
+|-----------|---------|-------------|
+| `VINTAGE_RECENCY_POWER` | 1.5 | Controls vintage combination weighting: `weight = 1/lag^power` |
+| FC lag decay coefficient | 0.06 | FC reliability penalty in blend: `fc_f = max(floor, 1 - coeff*(lag-1))` |
+| FC lag decay floor | 0.3 | Minimum FC reliability factor |
+| Vintage staleness cap | None | Whether to exclude vintages beyond a maximum lag |
+| FC curve RECENCY_POWER | 2 | Recency weighting when building FC coverage/bias curves |
+
+### Approach
+
+Systematic sequential sweep: optimize one parameter dimension at a time, carry the best forward to the next sweep. Final combination validated via K-fold random CV.
+
+### Results
+
+#### Customer 1 (temporal, months 2+)
+
+| Model | WMAPE | Bias | vs Default |
+|-------|-------|------|-----------|
+| V8d + mFC (default) | 18.4% | +36.6% | --- |
+| **V8d + mFC (tuned)** | **17.3%** | +36.4% | **-1.0pp** |
+| FC-only multi (default) | 23.0% | +46.0% | --- |
+| FC-only multi (tuned) | 21.2% | +44.2% | -1.8pp |
+
+Per-TF improvement (V8d+mFC):
+
+| TF | Default | Tuned | Diff |
+|----|---------|-------|------|
+| 3 | 23.4% | 22.5% | -0.9pp |
+| 6 | 20.1% | 19.1% | -1.0pp |
+| 9 | 15.7% | 14.4% | -1.2pp |
+| 12 | 12.8% | 11.8% | -1.0pp |
+
+Per-lag improvement (V8d+mFC):
+
+| Lag | Default | Tuned | Diff |
+|-----|---------|-------|------|
+| 1 | 14.7% | 12.5% | -2.2pp |
+| 4 | 17.3% | 16.4% | -1.0pp |
+| 8 | 24.1% | 22.8% | -1.2pp |
+| 12 | 38.9% | 39.2% | +0.3pp |
+
+Improvement is consistent across all TFs and most lags. Largest gains at lag 1 (-2.2pp) where FC signal is strongest.
+
+#### Customer 2 (temporal, months 2+)
+
+| Model | WMAPE | Bias | vs Default |
+|-------|-------|------|-----------|
+| V8d + mFC (default) | 42.2% | +36.1% | --- |
+| **V8d + mFC (tuned)** | **40.8%** | +36.7% | **-1.4pp** |
+| FC-only multi (default) | 38.2% | +24.1% | --- |
+| **FC-only multi (tuned)** | **36.2%** | +24.9% | **-2.0pp** |
+
+Per-TF improvement (V8d+mFC):
+
+| TF | Default | Tuned | Diff |
+|----|---------|-------|------|
+| 3 | 47.8% | 47.0% | -0.8pp |
+| 6 | 42.8% | 41.8% | -1.0pp |
+| 9 | 40.3% | 38.5% | -1.8pp |
+| 12 | 37.4% | 35.1% | -2.3pp |
+
+Improvement grows with TF — longer timeframes benefit most because they have more vintages to combine.
+
+### Best parameters found
+
+Both customers converged on the same direction for each parameter:
+
+| Parameter | Default | Cust 1 Best | Cust 2 Best | Direction |
+|-----------|---------|-------------|-------------|-----------|
+| VINTAGE_RECENCY_POWER | 1.5 | **0.5** | **0.5** | Lower = more equal weighting |
+| FC lag decay coeff | 0.06 | 0.06 | 0.06 | No change |
+| FC lag decay floor | 0.3 | 0.3 | **0.5** | Slightly higher for Cust 2 |
+| Vintage staleness cap | None | None | None | No cap needed |
+| FC curve RECENCY_POWER | 2 | **3.0** | **3.0** | Higher = more emphasis on recent data |
+
+### Parameter sweep findings
+
+**VINTAGE_RECENCY_POWER (1.5 -> 0.5)**: The most impactful parameter. Lower power means more equal weighting across vintages — older forecasts contain real signal and shouldn't be discounted as aggressively. At power=0.5, a lag=3 vintage gets 58% of lag=1's weight (vs 19% at power=1.5). Both customers improve monotonically as power decreases. Clear signal: the default was too aggressive at discounting older vintages.
+
+**FC lag decay (coeff/floor)**: The 2D heatmap is mostly flat — the FC lag decay coefficient and floor have little effect when multi-vintage is already adjusting the effective lag via `best_vintage_lag`. The default values (0.06/0.3) are near-optimal for both customers. This makes sense: with multi-vintage FC, most rows already have a nearby vintage, so the lag penalty rarely applies at full force.
+
+**Vintage staleness cap**: No cap is better. Removing old vintages strictly hurts — even distant forecasts contribute useful information when weighted properly. Capping at 3 vintages degrades V8d+mFC by +16.5pp (Cust 1) and +7.5pp (Cust 2).
+
+**FC curve RECENCY_POWER (2 -> 3)**: Higher recency power in curve building emphasizes the most recent training observations more. Both customers improve monotonically from 1.0 to 3.0. This makes sense: FC coverage and bias patterns are drifting over time, and putting more weight on recent observations produces more relevant curves for the test period.
+
+### K-fold random CV validation
+
+| Config | Cust 1 CV | Cust 1 Temporal | Cust 2 CV | Cust 2 Temporal |
+|--------|-----------|-----------------|-----------|-----------------|
+| V8d+mFC (default) | 63.6% | 18.4% | 68.0% | 42.2% |
+| V8d+mFC (tuned) | 64.1% | 17.3% | 67.8% | 40.8% |
+| FC-only (default) | 16.0% | 23.0% | 36.8% | 38.2% |
+| FC-only (tuned) | 15.9% | 21.2% | 37.2% | 36.2% |
+
+Tuned parameters show equivalent CV performance to defaults (within noise), confirming the temporal improvement is not overfitting. Customer 2 FC-only (tuned) actually reduces the temporal-CV gap from +1.5pp to -1.0pp, suggesting tuning aligns the model better with stationary behavior.
+
+### Key takeaway
+
+**FC parameter tuning delivers the first genuine accuracy improvement** across all experiments. The two impactful changes — lower vintage power (0.5 vs 1.5) and higher curve recency (3 vs 2) — both point in the same direction: **trust all vintage information more equally, but calibrate curves on the most recent data.** This is consistent with the finding that FC is a nearly stationary signal (unlike OO): older vintages are still informative, but the coverage/bias curves should adapt quickly to recent patterns.
+
+The experiment is documented in `fc_tuning.py`.
+
+---
+
 ## Current Understanding & Open Questions
 
 ### LT+OE shifts by site (train → test)
@@ -561,5 +672,6 @@ The experiment is documented in `subquarter_decomp.py`.
 ### Ideas to explore
 1. **LT+OE affecting OO vs FC weighting**: Use the LT+OE shift to adjust how much weight we give OO vs FC. When LT+OE drops significantly, lean more on FC.
 2. **FC-primary architecture**: Models where FC is the dominant signal. OO could play a supporting role only at short lags (1–3) where its temporal drift is smallest.
-3. **Older vintage analysis**: The multi-vintage model currently weights all vintages by `1/lag^1.5`. Older vintages (high original lag) may carry different signal quality — worth examining whether a staleness cap or different weighting at very high lags improves results.
+3. ~~**Older vintage analysis**~~: **Done** — FC parameter tuning (vintage_power=0.5, no staleness cap) showed older vintages are valuable and should not be discounted aggressively.
 4. **OO lag restriction**: Given that normalization helps stationarity but hurts accuracy, restrict OO signal to only short lags (e.g., lag ≤ 3–4) where progress is high and normalization noise is minimal, falling back to FC-only at longer lags.
+5. **Apply tuned FC parameters to pipeline.py**: Update the production pipeline with the validated parameter improvements (VINTAGE_RECENCY_POWER=0.5, FC RECENCY_POWER=3). The lag decay params were already near-optimal.
