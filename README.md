@@ -11,6 +11,7 @@ This project builds demand forecasting models that combine two signals — **Ope
 | `aging_v8g.py` | Customer 1 full pipeline: curve building, signal quality, V8d–V8k model variants, multi-vintage FC, random CV |
 | `customer2_fc.py` | Customer 2 FC-only pipeline: multi-vintage FC, temporal eval, random CV |
 | `oo_normalization.py` | Power-CDF OO normalization experiment: alpha estimation, normalized/damped curves, both customers |
+| `subquarter_decomp.py` | Sub-quarter decomposition experiment: bottom-up TF=3 predictions for TF=6/9/12, both customers |
 | `Dummy Training Data Customer 1 Try 2 11-Feb-2026.csv` | Customer 1 data (~13,500 rows) |
 | `Dummy_Training_Data_Customer_2_12-Feb-26.csv` | Customer 2 data (~19,000 rows) |
 
@@ -442,6 +443,107 @@ Despite not improving temporal accuracy, normalization dramatically improved sta
 The power-CDF model correctly captures the physics of ordering (site-specific alpha, progress-dependent visibility), and it successfully makes the OO signal more stationary. But the flat curves' recency weighting already compensates for LT+OE drift in the temporal evaluation window, and normalization introduces noise that outweighs the stationarity benefit. **This is a case where the theoretically correct model is outperformed by a simpler adaptive approach.**
 
 The experiment is documented in `oo_normalization.py`.
+
+---
+
+## Sub-Quarter Decomposition (Negative Result)
+
+### Motivation
+
+A TF=12 target period can be decomposed into four non-overlapping TF=3 sub-quarters. Each sub-quarter exists as its own TF=3 row at the same Reference_Month but at progressively higher effective lags (`eff_lag = parent_lag + 3*k`). The hypothesis: predicting each sub-quarter independently using TF=3 curves and summing could be more accurate than a single TF=12 prediction, because TF=3 curves may be better calibrated and the decomposition naturally captures front-loaded vs back-loaded ordering patterns.
+
+### Data verification
+
+**Perfect additivity confirmed** for both customers: TF=3 Actual_Sales and Open_Orders sum exactly to TF=6/9/12 values (100% match for all fully-matched rows).
+
+Sub-quarter availability depends on effective lag (max lag in data = 12):
+
+| Parent TF | Full coverage (all subs) | Partial coverage |
+|-----------|------------------------|-----------------|
+| TF=6 | Parent lag 1–9 | Lag 10–12: 1 of 2 |
+| TF=9 | Parent lag 1–6 | Lag 7–9: 2 of 3 |
+| TF=12 | Parent lag 1–3 | Lag 4+: progressively fewer |
+
+### Variants tested
+
+- **BU-OO (all-or-nothing)**: Only predict when ALL sub-quarters have data and curve coverage. Falls back to per-TF flat curve otherwise.
+- **BU-OO (shares)**: Scale available sub-quarter predictions by historical share to fill missing quarters. Historical shares computed per (site, parent_TF, sub-quarter index).
+- Combined with both flat FC and multi-vintage FC.
+
+### Results
+
+#### Customer 1 (temporal, months 2+)
+
+| Model | WMAPE | Bias |
+|-------|-------|------|
+| **V8d + mFC** | **18.4%** | +36.6% |
+| BU-OO(sh) + mFC | 18.6% | +33.4% |
+| BU-OO + mFC | 19.4% | +35.8% |
+| FC-only multi | 23.0% | +46.0% |
+
+Per-TF breakdown:
+
+| TF | V8d + mFC | BU-OO + mFC | BU-OO(sh) + mFC |
+|----|-----------|-------------|-----------------|
+| 3 | 23.4% | 23.4% | 23.4% |
+| 6 | 20.1% | 21.0% | **19.9%** |
+| 9 | 15.7% | 17.0% | **15.5%** |
+| 12 | **12.8%** | 14.7% | 14.9% |
+
+#### Customer 2 (temporal, months 2+)
+
+| Model | WMAPE | Bias |
+|-------|-------|------|
+| **FC-only multi** | **38.2%** | +24.1% |
+| V8d + mFC | 42.2% | +36.1% |
+| BU-OO + mFC | 42.3% | +41.2% |
+| BU-OO(sh) + mFC | 44.2% | +41.2% |
+
+Per-TF breakdown:
+
+| TF | V8d + mFC | BU-OO + mFC | BU-OO(sh) + mFC |
+|----|-----------|-------------|-----------------|
+| 3 | 47.8% | 47.8% | 47.8% |
+| 6 | 42.8% | 43.4% | 45.1% |
+| 9 | 40.3% | 40.4% | 42.3% |
+| 12 | 37.4% | **36.8%** | 41.4% |
+
+### Stationarity improvement
+
+Bottom-up OO is more stationary than flat OO (smaller temporal-vs-random CV gap):
+
+| Model | Customer 1 Gap | Customer 2 Gap |
+|-------|---------------|---------------|
+| V8d + mFC | -45.2pp | -25.8pp |
+| BU-OO + mFC | -33.3pp | -12.7pp |
+| FC-only multi | +7.0pp | +1.5pp |
+
+### Historical sub-quarter shares
+
+Most sites have fairly uniform quarterly shares within longer TFs:
+
+| Site | TF=12 Q1 | Q2 | Q3 | Q4 | Pattern |
+|------|----------|-----|-----|-----|---------|
+| Site W | 23.9% | 24.6% | 25.3% | 26.2% | ~Even |
+| Site S | 24.6% | 24.1% | 24.9% | 26.5% | ~Even |
+| Site T | 24.9% | 24.1% | 23.8% | 24.4% | ~Even |
+| Site A | 5.5% | 25.2% | 34.2% | 68.3% | Highly seasonal |
+
+With most sites showing near-even shares, there is limited front/back-loading signal for the decomposition to exploit.
+
+### Why decomposition didn't improve temporal accuracy
+
+1. **Error accumulation**: Summing 2–4 noisy TF=3 predictions introduces more variance than a single per-TF prediction. OO signal WMAPE: flat 43.0% vs BU 44.9% (Customer 1).
+2. **High effective lags add noise**: Later sub-quarters have effective lags of 7–12+, where TF=3 OO curves are least reliable.
+3. **Even quarterly shares**: Most sites split evenly across quarters (23–27% each), so decomposition provides minimal information gain over the aggregate.
+4. **Shares scaling**: Pro-rating partial decompositions (shares mode) amplifies errors from the sub-quarters that are available.
+5. **Marginal TF=6/9 improvement**: BU(shares) shows tiny gains for Customer 1 TF=6 (-0.2pp) and TF=9 (-0.2pp), but these are offset by TF=12 degradation.
+
+### Key takeaway
+
+Bottom-up decomposition is structurally sound (perfect additivity) and produces a more stationary OO signal. But the noise from summing multiple TF=3 predictions outweighs any benefit from capturing quarterly ordering patterns. **The per-TF flat curves already capture timeframe-specific dynamics more efficiently than reconstructing them from sub-quarters.** The one exception — Site A's extreme seasonality (Q1=5.5%, Q4=68.3%) — suggests decomposition could help for highly seasonal sites, but there aren't enough such sites to move the overall metric.
+
+The experiment is documented in `subquarter_decomp.py`.
 
 ---
 
