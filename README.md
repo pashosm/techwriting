@@ -10,6 +10,7 @@ This project builds demand forecasting models that combine two signals — **Ope
 |------|---------|
 | `aging_v8g.py` | Customer 1 full pipeline: curve building, signal quality, V8d–V8k model variants, multi-vintage FC, random CV |
 | `customer2_fc.py` | Customer 2 FC-only pipeline: multi-vintage FC, temporal eval, random CV |
+| `oo_normalization.py` | Power-CDF OO normalization experiment: alpha estimation, normalized/damped curves, both customers |
 | `Dummy Training Data Customer 1 Try 2 11-Feb-2026.csv` | Customer 1 data (~13,500 rows) |
 | `Dummy_Training_Data_Customer_2_12-Feb-26.csv` | Customer 2 data (~19,000 rows) |
 
@@ -338,10 +339,113 @@ The intervals communicate two things simultaneously:
 
 ---
 
-## Current Understanding & Open Questions
+## Power-CDF OO Normalization (Negative Result)
 
-### Why V8k over-corrects for Sites S and T
-The progress model assumes orders are **uniformly distributed** across the ordering window. In reality, orders concentrate earlier in the window, especially for longer timeframes. This means the correction at lags near the boundary may be too aggressive.
+### Motivation
+
+V8k's uniform CDF correction assumed `alpha=1` (orders distributed uniformly across the ordering window). Data exploration revealed that the ordering curve actually follows a **power law** `OO_ratio ~ progress^alpha` with **site-specific alpha**, explaining why V8k over-corrected Sites S and T.
+
+### Alpha Estimation
+
+Estimated via weighted log-log OLS regression: `log(OO_ratio) = alpha × log(progress) + c`, with recency weighting (`RECENCY_POWER=2`), clipped to [0.3, 4.0].
+
+#### Customer 1 — Per-site alpha
+
+| Site | Alpha | N obs | Interpretation |
+|------|-------|-------|----------------|
+| Site D | 1.05 | 441 | Nearly uniform ordering |
+| Site S | 1.65 | 496 | Moderately back-loaded |
+| Site T | 2.30 | 369 | Heavily back-loaded |
+| Site W | 2.48 | 485 | Heavily back-loaded |
+
+#### Customer 1 — Per-(site, timeframe) alpha
+
+Alpha increases with timeframe for most sites, suggesting more back-loaded ordering at longer horizons:
+
+| Site | TF3 | TF6 | TF9 | TF12 |
+|------|-----|-----|-----|------|
+| Site D | 1.00 | 0.94 | 1.14 | 1.10 |
+| Site S | 1.25 | 1.60 | 2.04 | 2.00 |
+| Site T | 1.56 | 2.14 | 2.66 | 3.06 |
+| Site W | 2.13 | 2.69 | 2.84 | 2.98 |
+
+#### Customer 2 — Per-site alpha
+
+| Site | Alpha | N obs |
+|------|-------|-------|
+| Other-PS EMEA | 0.30 | 175 |
+| Site H | 1.03 | 630 |
+| Site B | 2.34 | 629 |
+
+### Approach: Normalized OO Curves
+
+```
+progress = max(ε, 1 - lag / (LT + OE))
+OO_ratio_norm = OO_ratio / progress^alpha       (training: normalized ratio)
+implied_actual = OO / (curve_norm × progress^alpha)  (prediction)
+```
+
+Curves built on the normalized ratio per `(site, tf, lag)` with recency weighting. Also tested a **damped variant** that blends between normalized and flat using a smoothstep function of progress, to avoid noise amplification at high lags.
+
+### Variants tested
+
+| Variant | Description |
+|---------|-------------|
+| NormS | Per-site alpha, normalized curves |
+| NormST | Per-(site, timeframe) alpha, normalized curves |
+| DampS | Per-site alpha, damped correction on flat curves |
+| DampST | Per-(site, tf) alpha, damped correction on flat curves |
+
+Each combined with both flat FC and multi-vintage FC.
+
+### Results
+
+#### Customer 1 (temporal, months 2+)
+
+| Model | WMAPE | Bias |
+|-------|-------|------|
+| **V8d + mFC** | **18.4%** | -0.4% |
+| NormS + mFC | 20.1% | +2.9% |
+| NormST + mFC | 20.2% | +3.1% |
+| DampS + mFC | 21.9% | +5.3% |
+| DampST + mFC | 22.0% | +5.3% |
+| FC-only multi | 23.0% | +4.3% |
+
+#### Customer 2 (temporal, months 2+)
+
+| Model | WMAPE | Bias |
+|-------|-------|------|
+| **FC-only multi** | **38.2%** | +12.5% |
+| V8d + mFC | 42.2% | +3.1% |
+| NormS + mFC | 45.0% | +5.5% |
+| DampS + mFC | 46.9% | +10.3% |
+| DampST + mFC | 47.6% | +10.7% |
+
+### Stationarity improvement (positive)
+
+Despite not improving temporal accuracy, normalization dramatically improved stationarity as measured by the temporal-vs-random CV gap:
+
+| Model | Customer 1 Gap | Customer 2 Gap |
+|-------|---------------|---------------|
+| V8d + mFC | 76.6pp | 66.7pp |
+| NormS + mFC | 26.1pp | 22.4pp |
+| NormST + mFC | 23.8pp | 26.3pp |
+
+### Why normalization didn't improve temporal accuracy
+
+1. **Noise amplification at high lags**: Dividing by `progress^alpha` when progress is small (high lags, short LT+OE) amplifies noise. Customer 1 lag 12: V8d 78.7% → NormS 108.6%.
+2. **Recency weighting already handles drift**: Flat curves with `RECENCY_POWER=2` naturally downweight old observations, providing implicit adaptation to LT+OE changes. The normalization disrupts this already-adequate calibration.
+3. **Damped correction doesn't help**: Blending normalized and flat based on progress level didn't find a sweet spot — the correction either applied too aggressively (short lags where flat was fine) or not enough (long lags where noise dominates).
+
+### Key takeaway
+
+The power-CDF model correctly captures the physics of ordering (site-specific alpha, progress-dependent visibility), and it successfully makes the OO signal more stationary. But the flat curves' recency weighting already compensates for LT+OE drift in the temporal evaluation window, and normalization introduces noise that outweighs the stationarity benefit. **This is a case where the theoretically correct model is outperformed by a simpler adaptive approach.**
+
+The experiment is documented in `oo_normalization.py`.
+
+---
+
+## Current Understanding & Open Questions
 
 ### LT+OE shifts by site (train → test)
 | Site | LT+OE train | LT+OE test | Shift |
@@ -353,7 +457,7 @@ The progress model assumes orders are **uniformly distributed** across the order
 | Site J | 13.0 | 10.2 | -2.8 |
 
 ### Ideas to explore
-1. **Non-uniform ordering CDF**: A different CDF shape (e.g. beta distribution, or empirically estimated) could moderate the correction for lags near the boundary.
-2. **LT+OE affecting OO vs FC weighting**: Use the LT+OE shift to adjust how much weight we give OO vs FC. When LT+OE drops significantly, lean more on FC.
-3. **FC-primary architecture**: Models where FC is the dominant signal. OO could play a supporting role only at short lags (1–3) where its temporal drift is smallest.
-4. **Older vintage analysis**: The multi-vintage model currently weights all vintages by `1/lag^1.5`. Older vintages (high original lag) may carry different signal quality — worth examining whether a staleness cap or different weighting at very high lags improves results.
+1. **LT+OE affecting OO vs FC weighting**: Use the LT+OE shift to adjust how much weight we give OO vs FC. When LT+OE drops significantly, lean more on FC.
+2. **FC-primary architecture**: Models where FC is the dominant signal. OO could play a supporting role only at short lags (1–3) where its temporal drift is smallest.
+3. **Older vintage analysis**: The multi-vintage model currently weights all vintages by `1/lag^1.5`. Older vintages (high original lag) may carry different signal quality — worth examining whether a staleness cap or different weighting at very high lags improves results.
+4. **OO lag restriction**: Given that normalization helps stationarity but hurts accuracy, restrict OO signal to only short lags (e.g., lag ≤ 3–4) where progress is high and normalization noise is minimal, falling back to FC-only at longer lags.
