@@ -26,12 +26,13 @@ warnings.filterwarnings('ignore')
 # ============================================================
 # CONSTANTS (shared across all customers)
 # ============================================================
-RECENCY_POWER = 2          # Power for recency weighting in curve building
+RECENCY_POWER = 2          # Power for recency weighting in OO curve building
+FC_RECENCY_POWER = 3       # Power for recency weighting in FC curve building (tuned from 2)
 MIN_OBS_FLAT = 3           # Minimum observations to build a flat curve
 MIN_OBS_COND = 8           # Minimum observations for conditioned regression
 MIN_R2_IMPROVE = 0.05      # Conditioned curve must improve R² by at least this
 MIN_SITE_ROWS = 30         # Auto-exclude sites with fewer rows than this
-VINTAGE_RECENCY_POWER = 1.5  # Power for inverse-lag weighting in multi-vintage
+VINTAGE_RECENCY_POWER = 0.5   # Power for inverse-lag weighting in multi-vintage (tuned from 1.5)
 N_FOLDS = 5                # Number of folds for random CV
 RANDOM_SEED = 42
 OO_NONSTATIONARY_GAP = 20  # If random CV WMAPE exceeds temporal by this many pp, flag OO
@@ -109,7 +110,7 @@ def load_and_preprocess(filepath, dollar_cols=None):
 
 # ---- Curve Building ----
 
-def build_flat_curves(train_df, ratio_col, start=None):
+def build_flat_curves(train_df, ratio_col, start=None, recency_power=RECENCY_POWER):
     """Build recency-weighted flat aging curves.
 
     Returns dict: {(gsa_site, Timeframe, Prediction_Lag): value}
@@ -123,7 +124,7 @@ def build_flat_curves(train_df, ratio_col, start=None):
         if len(valid) < MIN_OBS_FLAT:
             continue
         days = (valid['Reference_Month'] - valid['Reference_Month'].min()).dt.days / 365
-        wts = (1 + days.values) ** RECENCY_POWER
+        wts = (1 + days.values) ** recency_power
         flat[(gs, tf, lag)] = np.average(valid[ratio_col], weights=wts)
 
     # Fallback: pooled across timeframes
@@ -131,7 +132,7 @@ def build_flat_curves(train_df, ratio_col, start=None):
         valid = grp[grp[ratio_col].notna() & (grp[ratio_col] > 0) & (grp[ratio_col] < 10)]
         if len(valid) >= MIN_OBS_FLAT:
             days = (valid['Reference_Month'] - valid['Reference_Month'].min()).dt.days / 365
-            wts = (1 + days.values) ** RECENCY_POWER
+            wts = (1 + days.values) ** recency_power
             flat[('FB', gs, lag)] = np.average(valid[ratio_col], weights=wts)
 
     return flat
@@ -706,8 +707,8 @@ def run_customer_pipeline(cust_df, customer_name):
     # ---- Build flat curves ----
     print(f"\n  Building curves...")
     oo_flat = build_flat_curves(train, 'oo_ratio', start='2023-01-01')
-    cov_flat = build_flat_curves(train, 'fc_coverage', start='2023-01-01')
-    bias_flat = build_flat_curves(train, 'fc_bias', start='2023-01-01')
+    cov_flat = build_flat_curves(train, 'fc_coverage', start='2023-01-01', recency_power=FC_RECENCY_POWER)
+    bias_flat = build_flat_curves(train, 'fc_bias', start='2023-01-01', recency_power=FC_RECENCY_POWER)
     print(f"    OO curves: {len(oo_flat)}  |  FC coverage: {len(cov_flat)}  |  "
           f"FC bias: {len(bias_flat)}")
 
@@ -872,8 +873,8 @@ def run_customer_pipeline(cust_df, customer_name):
 
         # Build curves from fold training data
         oo_f = build_flat_curves(f_train, 'oo_ratio', start='2023-01-01')
-        cov_f = build_flat_curves(f_train, 'fc_coverage', start='2023-01-01')
-        bias_f = build_flat_curves(f_train, 'fc_bias', start='2023-01-01')
+        cov_f = build_flat_curves(f_train, 'fc_coverage', start='2023-01-01', recency_power=FC_RECENCY_POWER)
+        bias_f = build_flat_curves(f_train, 'fc_bias', start='2023-01-01', recency_power=FC_RECENCY_POWER)
 
         # Apply flat curves
         apply_flat_curves(f_train, oo_f, cov_f, bias_f)
