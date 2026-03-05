@@ -1,15 +1,21 @@
 #!/usr/bin/env python3
 """
-Curve Similarity Feasibility Check (v2)
-========================================
+Curve Similarity Feasibility Check (v3 — full anonymized dataset)
+==================================================================
 Question: Can proxy features OBSERVABLE AT FORECAST TIME predict which sites
 have similar forecast_coverage and forecast_bias aging curves?
 
-Key constraint: NO features that require Actual_Sales (only known after the fact).
-Observable fields: Historical_Sales_Lag1, Historical_Sales_Lag12, Open_Orders,
-                   Forecast_Value, Covered_Orders — plus ratios of these.
+Dataset: training_data_anonymized.csv (160 sites, 24 customers, 420K rows)
+Filter:  TF=12 only. Curves are 12-point vectors across Lags 1–12.
 
-Filtered to TF=12 only. Curves are 12-point vectors across Lags 1–12.
+Observable fields (no Actual_Sales):
+  Raw:    Historical_Sales_Lag1, Historical_Sales_Lag12, Open_Orders,
+          Forecast_Value, Covered_Orders, Covered_Open_Orders
+  Pre-computed: OO_Coverage (= Covered_Open_Orders / Open_Orders),
+                OO_Bias (= Forecast_Value / Covered_Open_Orders)
+  Derived ratios: FC/SL1, OO/SL1, CO/SL1, etc.
+
+Ground truth: Coverage (= Covered_Orders / Actual_Sales) and Bias curves.
 """
 
 import pandas as pd
@@ -18,38 +24,39 @@ from scipy import stats
 from itertools import combinations
 
 pd.set_option('display.max_columns', 20)
-pd.set_option('display.width', 140)
+pd.set_option('display.width', 160)
 pd.set_option('display.float_format', lambda x: f'{x:.4f}')
 
 # ── 1. Load & filter ──────────────────────────────────────────────
-CSV = "/home/user/techwriting/Dummy Training Data Customer 1 Try 2 11-Feb-2026.csv"
+CSV = "/home/user/techwriting/training_data_anonymized.csv"
 df = pd.read_csv(CSV)
-df['Reference_Month'] = pd.to_datetime(df['Reference_Month'])
-
-# Filter to TF=12 only
 df = df[df['Timeframe'] == 12].copy()
-
-# Ground truth metrics (use Actual_Sales ONLY for the curve we're trying to predict)
-df['fc_coverage'] = np.where(
-    df['Actual_Sales'] > 0,
-    df['Covered_Orders'] / df['Actual_Sales'], np.nan)
-df['fc_bias'] = np.where(
-    df['Covered_Orders'] > 0,
-    df['Forecast_Value'] / df['Covered_Orders'], np.nan)
 
 sites = sorted(df['Site'].unique())
 lags = sorted(df['Prediction_Lag'].unique())
+customers = sorted(df['GSA'].unique())
 
 print("=" * 90)
-print("CURVE SIMILARITY FEASIBILITY CHECK (v2)")
+print("CURVE SIMILARITY FEASIBILITY CHECK (v3 — full dataset)")
 print("Filtered to TF=12 | Observable-at-forecast-time proxies only")
 print("=" * 90)
-print(f"\nSites: {sites}")
-print(f"Curve: {len(lags)} lags (1–12) at TF=12")
+print(f"\n{len(sites)} sites, {len(customers)} customers, {len(df)} rows at TF=12")
+print(f"Curve: {len(lags)} lags (1–12)")
 
 # ── 2. Build aging curve vectors per site ──────────────────────────
+# Ground truth: Coverage and Bias (these use Actual_Sales)
+# Coverage is NaN when Covered_Orders == 0 (no forecast), and Bias similarly.
+# We compute fc_coverage ourselves to include zero-coverage cases.
+
+df['fc_coverage'] = np.where(
+    df['Actual_Sales'] > 0,
+    df['Covered_Orders'] / df['Actual_Sales'], np.nan)
+df['fc_bias'] = df['Bias']  # already pre-computed
+
 cov_curves = {}
 bias_curves = {}
+site_obs_count = {}
+
 for site in sites:
     sd = df[df['Site'] == site]
     cov_vec = []
@@ -60,14 +67,16 @@ for site in sites:
         bias_vec.append(cell['fc_bias'].mean())
     cov_curves[site] = np.array(cov_vec)
     bias_curves[site] = np.array(bias_vec)
+    site_obs_count[site] = len(sd)
 
-print("\n--- Curve vector completeness ---")
-print(f"{'Site':<25} {'Coverage pts':>14} {'Bias pts':>14}")
-print("-" * 55)
-for site in sites:
-    cov_ok = np.sum(~np.isnan(cov_curves[site]))
-    bias_ok = np.sum(~np.isnan(bias_curves[site]))
-    print(f"{site:<25} {cov_ok:>10}/{len(lags):<4} {bias_ok:>10}/{len(lags):<4}")
+# Filter to sites with enough curve data
+MIN_COV_PTS = 8
+MIN_BIAS_PTS = 5
+valid_cov_sites = [s for s in sites if np.sum(~np.isnan(cov_curves[s])) >= MIN_COV_PTS]
+valid_bias_sites = [s for s in sites if np.sum(~np.isnan(bias_curves[s])) >= MIN_BIAS_PTS]
+
+print(f"\nSites with >= {MIN_COV_PTS} coverage curve points: {len(valid_cov_sites)}")
+print(f"Sites with >= {MIN_BIAS_PTS} bias curve points: {len(valid_bias_sites)}")
 
 
 # ── 3. Pairwise curve similarity ──────────────────────────────────
@@ -84,68 +93,74 @@ def curve_similarity(vec_a, vec_b):
     return r, n
 
 
+# Only compute within-customer pairs (the use case is: new site for a customer,
+# borrow from existing sites of that customer) AND cross-customer pairs.
+# But with 160 sites, all-pairs is 12,720 — manageable.
+
 print("\n" + "=" * 90)
-print("SECTION 1: PAIRWISE CURVE SIMILARITY (Ground Truth)")
+print("SECTION 1: COMPUTING PAIRWISE CURVE SIMILARITY")
 print("=" * 90)
 
-print("\n--- Coverage curve similarity (Pearson r) ---")
-print(f"{'Pair':<50} {'r':>8} {'N pts':>8}")
-print("-" * 70)
-cov_sim_pairs = []
-for s1, s2 in combinations(sites, 2):
+# Coverage similarity for all valid pairs
+cov_sim = {}
+for s1, s2 in combinations(valid_cov_sites, 2):
     r, n = curve_similarity(cov_curves[s1], cov_curves[s2])
-    cov_sim_pairs.append((s1, s2, r, n))
-    rstr = f"{r:.4f}" if not np.isnan(r) else "   NaN"
-    print(f"{s1} — {s2:<25} {rstr:>8} {n:>8}")
+    if not np.isnan(r):
+        cov_sim[(s1, s2)] = r
 
-print("\n--- Bias curve similarity (Pearson r) ---")
-print(f"{'Pair':<50} {'r':>8} {'N pts':>8}")
-print("-" * 70)
-bias_sim_pairs = []
-for s1, s2 in combinations(sites, 2):
+# Bias similarity for all valid pairs
+bias_sim = {}
+for s1, s2 in combinations(valid_bias_sites, 2):
     r, n = curve_similarity(bias_curves[s1], bias_curves[s2])
-    bias_sim_pairs.append((s1, s2, r, n))
-    rstr = f"{r:.4f}" if not np.isnan(r) else "   NaN"
-    print(f"{s1} — {s2:<25} {rstr:>8} {n:>8}")
+    if not np.isnan(r):
+        bias_sim[(s1, s2)] = r
 
-# Combined
+print(f"Coverage: {len(cov_sim)} valid pairs")
+print(f"Bias: {len(bias_sim)} valid pairs")
+
+# Distribution of similarities
+if cov_sim:
+    cov_vals = np.array(list(cov_sim.values()))
+    print(f"\nCoverage similarity distribution:")
+    print(f"  mean={cov_vals.mean():.3f}  median={np.median(cov_vals):.3f}  "
+          f"std={cov_vals.std():.3f}  min={cov_vals.min():.3f}  max={cov_vals.max():.3f}")
+
+if bias_sim:
+    bias_vals = np.array(list(bias_sim.values()))
+    print(f"Bias similarity distribution:")
+    print(f"  mean={bias_vals.mean():.3f}  median={np.median(bias_vals):.3f}  "
+          f"std={bias_vals.std():.3f}  min={bias_vals.min():.3f}  max={bias_vals.max():.3f}")
+
+# Combined similarity
 combined_sim = {}
-for (s1, s2, cr, cn), (_, _, br, bn) in zip(cov_sim_pairs, bias_sim_pairs):
+all_pairs = set(list(cov_sim.keys()) + list(bias_sim.keys()))
+for pair in all_pairs:
+    cr = cov_sim.get(pair, np.nan)
+    br = bias_sim.get(pair, np.nan)
     if not np.isnan(cr) and not np.isnan(br):
-        combo = (cr + br) / 2
+        combined_sim[pair] = (cr + br) / 2
     elif not np.isnan(cr):
-        combo = cr
-    else:
-        combo = np.nan
-    combined_sim[(s1, s2)] = combo
+        combined_sim[pair] = cr
 
-# ── 4. Observable-at-forecast-time proxy features ──────────────────
-# Raw fields: Historical_Sales_Lag1, Historical_Sales_Lag12, Open_Orders,
-#             Forecast_Value, Covered_Orders
-# Derived ratios (all from observable fields — NO Actual_Sales):
-#   OO_coverage  = Covered_Orders / Sales_Lag1
-#   OO_bias      = Forecast_Value / Covered_Orders
-#   OO_FC_ratio  = Open_Orders / Forecast_Value
-#   FC_Sales     = Forecast_Value / Sales_Lag1
-#   OO_Sales     = Open_Orders / Sales_Lag1
-#   CO_Sales     = Covered_Orders / Sales_Lag1
+print(f"Combined: {len(combined_sim)} valid pairs")
 
+# ── 4. Observable proxy features per site ──────────────────────────
 print("\n" + "=" * 90)
-print("SECTION 2: OBSERVABLE PROXY FEATURES (no Actual_Sales)")
+print("SECTION 2: OBSERVABLE PROXY FEATURES")
 print("=" * 90)
 
 proxy_features = {}
 for site in sites:
     sd = df[df['Site'] == site]
 
-    sales1 = sd['Historical_Sales_Lag1']
-    sales12 = sd['Historical_Sales_Lag12']
+    sl1 = sd['Historical_Sales_Lag1']
+    sl12 = sd['Historical_Sales_Lag12']
     oo = sd['Open_Orders']
     fc = sd['Forecast_Value']
     co = sd['Covered_Orders']
+    coo = sd['Covered_Open_Orders']
 
     def safe_ratio(num, denom):
-        """Mean of element-wise ratio where denom > 0."""
         mask = denom > 0
         if mask.sum() == 0:
             return np.nan
@@ -153,141 +168,160 @@ for site in sites:
 
     proxy_features[site] = {
         # Raw means
-        'sales_lag1': sales1.mean(),
-        'sales_lag12': sales12.mean(),
+        'sales_lag1': sl1.mean(),
+        'sales_lag12': sl12.mean(),
         'open_orders': oo.mean(),
         'forecast_value': fc.mean(),
         'covered_orders': co.mean(),
-        # Ratios (all observable at forecast time)
-        'OO_cov (CO/SL1)': safe_ratio(co, sales1),
-        'OO_bias (FC/CO)': safe_ratio(fc, co),
+        'covered_oo': coo.mean(),
+        # Pre-computed observable ratios (no Actual_Sales)
+        'OO_Coverage': sd['OO_Coverage'].mean(),  # Covered_OO / Open_Orders
+        'OO_Bias': sd['OO_Bias'].mean(),          # Forecast / Covered_OO
+        # Derived ratios (all observable at forecast time)
+        'FC/SL1': safe_ratio(fc, sl1),
+        'OO/SL1': safe_ratio(oo, sl1),
+        'CO/SL1': safe_ratio(co, sl1),
+        'COO/SL1': safe_ratio(coo, sl1),
         'OO/FC': safe_ratio(oo, fc),
-        'FC/SL1': safe_ratio(fc, sales1),
-        'OO/SL1': safe_ratio(oo, sales1),
-        'CO/SL12': safe_ratio(co, sales12),
+        'COO/OO': safe_ratio(coo, oo),
+        'FC/CO': safe_ratio(fc, co),
     }
 
 proxy_df = pd.DataFrame(proxy_features).T
-print("\nProxy feature summary per site:")
-print(proxy_df.to_string())
+
+# Show summary stats for proxy features
+print("\nProxy feature summary (across all sites):")
+print(proxy_df.describe().to_string())
 
 # ── 5. Correlate each proxy with curve similarity ──────────────────
 print("\n" + "=" * 90)
 print("SECTION 3: DOES PROXY SIMILARITY PREDICT CURVE SIMILARITY?")
 print("=" * 90)
-print("Spearman r between |proxy_A - proxy_B| and curve similarity(A, B)")
-print("Negative r = sites with similar proxy have similar curves (good)")
+print("Spearman r between |proxy_A - proxy_B| and curve_similarity(A, B)")
+print("Negative r = sites with similar proxy have similar curves (good)\n")
 
-# Build pairwise vectors
-cov_sim_vec = []
-combined_sim_vec = []
-for s1, s2 in combinations(sites, 2):
-    match_cov = [x[2] for x in cov_sim_pairs if x[0] == s1 and x[1] == s2]
-    cov_sim_vec.append(match_cov[0] if match_cov else np.nan)
-    combined_sim_vec.append(combined_sim.get((s1, s2), np.nan))
-cov_sim_vec = np.array(cov_sim_vec)
-combined_sim_vec = np.array(combined_sim_vec)
+proxy_cols = list(proxy_df.columns)
 
-for target_label, sim_vec in [("COVERAGE curve", cov_sim_vec),
-                                ("COMBINED curve", combined_sim_vec)]:
-    print(f"\n--- vs {target_label} similarity ---")
-    print(f"{'Proxy feature':<25} {'Spearman r':>12} {'p-value':>10} {'N pairs':>10} {'Signal?'}")
-    print("-" * 75)
+for target_label, sim_dict in [("COVERAGE curve", cov_sim),
+                                 ("BIAS curve", bias_sim),
+                                 ("COMBINED curve", combined_sim)]:
+    if not sim_dict:
+        continue
 
-    for col in proxy_df.columns:
+    pairs = list(sim_dict.keys())
+    sim_vec = np.array([sim_dict[p] for p in pairs])
+
+    print(f"--- vs {target_label} similarity ({len(pairs)} pairs) ---")
+    print(f"{'Proxy feature':<20} {'Spearman r':>12} {'p-value':>12} {'N pairs':>10} {'Signal?'}")
+    print("-" * 70)
+
+    results = []
+    for col in proxy_cols:
         proxy_dist = []
-        for s1, s2 in combinations(sites, 2):
+        valid_mask = []
+        for s1, s2 in pairs:
             v1 = proxy_df.loc[s1, col]
             v2 = proxy_df.loc[s2, col]
-            proxy_dist.append(abs(v1 - v2))
+            d = abs(v1 - v2)
+            proxy_dist.append(d)
+            valid_mask.append(not np.isnan(d))
         proxy_dist = np.array(proxy_dist)
+        valid_mask = np.array(valid_mask)
 
-        mask = ~np.isnan(proxy_dist) & ~np.isnan(sim_vec)
-        n = mask.sum()
-        if n >= 5:
-            r, p = stats.spearmanr(proxy_dist[mask], sim_vec[mask])
-            if r < -0.3 and p < 0.1:
-                sig = "PROMISING"
-            elif r < -0.2:
-                sig = "weak"
-            else:
-                sig = "—"
-            print(f"{col:<25} {r:>12.4f} {p:>10.4f} {n:>10} {sig}")
+        n = valid_mask.sum()
+        if n >= 20:
+            r, p = stats.spearmanr(proxy_dist[valid_mask], sim_vec[valid_mask])
+            results.append((col, r, p, n))
         else:
-            print(f"{col:<25} {'insuff.':>12} {'':>10} {n:>10}")
+            results.append((col, np.nan, np.nan, n))
 
-# ── 6. Multi-feature: ratio-only composite ─────────────────────────
-print("\n" + "=" * 90)
-print("SECTION 4: COMPOSITE RATIO PROXY (all ratios combined)")
+    # Sort by Spearman r (most negative = best)
+    results.sort(key=lambda x: x[1] if not np.isnan(x[1]) else 999)
+    for col, r, p, n in results:
+        if np.isnan(r):
+            print(f"{col:<20} {'insuff.':>12} {'':>12} {n:>10}")
+        else:
+            sig = "PROMISING" if (r < -0.3 and p < 0.05) else \
+                  "weak" if r < -0.15 else "—"
+            print(f"{col:<20} {r:>12.4f} {p:>12.6f} {n:>10} {sig}")
+    print()
+
+# ── 6. Within-customer vs cross-customer analysis ─────────────────
 print("=" * 90)
-
-ratio_cols = ['OO_cov (CO/SL1)', 'OO_bias (FC/CO)', 'OO/FC', 'FC/SL1', 'OO/SL1', 'CO/SL12']
-usable_ratio = [c for c in ratio_cols if proxy_df[c].notna().all()]
-print(f"Usable ratio features: {usable_ratio}")
-
-if len(usable_ratio) >= 2:
-    proxy_std = proxy_df[usable_ratio].copy()
-    for c in usable_ratio:
-        mu, sigma = proxy_std[c].mean(), proxy_std[c].std()
-        if sigma > 0:
-            proxy_std[c] = (proxy_std[c] - mu) / sigma
-
-    ratio_dist = []
-    for s1, s2 in combinations(sites, 2):
-        d = np.sqrt(((proxy_std.loc[s1] - proxy_std.loc[s2]) ** 2).sum())
-        ratio_dist.append(d)
-    ratio_dist = np.array(ratio_dist)
-
-    for label, sim_vec in [("Coverage", cov_sim_vec), ("Combined", combined_sim_vec)]:
-        mask = ~np.isnan(ratio_dist) & ~np.isnan(sim_vec)
-        n = mask.sum()
-        if n >= 5:
-            r, p = stats.spearmanr(ratio_dist[mask], sim_vec[mask])
-            print(f"\n  All-ratio composite vs {label} curve similarity:")
-            print(f"    Spearman r = {r:.4f}, p = {p:.4f}, N = {n}")
-            print(f"    {'PROMISING' if (r < -0.3 and p < 0.1) else 'weak/no signal'}")
-
-# ── 7. Pair-level detail ──────────────────────────────────────────
-print("\n" + "=" * 90)
-print("SECTION 5: PAIR-LEVEL DETAIL")
+print("SECTION 4: WITHIN-CUSTOMER vs CROSS-CUSTOMER")
 print("=" * 90)
-print(f"{'Pair':<42} {'Cov r':>7} {'Bias r':>7} {'OO_cov diff':>12} {'OO_bias diff':>13} {'OO/FC diff':>11}")
-print("-" * 95)
+print("Does similarity work better when comparing sites of the same customer?\n")
 
-ranked = sorted(
-    [(s1, s2) for s1, s2 in combinations(sites, 2)],
-    key=lambda x: combined_sim.get(x, -99) if not np.isnan(combined_sim.get(x, np.nan)) else -99,
-    reverse=True
-)
+# Map site → customer
+site_to_cust = df.groupby('Site')['GSA'].first().to_dict()
 
-for s1, s2 in ranked:
-    cr = [x[2] for x in cov_sim_pairs if x[0] == s1 and x[1] == s2][0]
-    br = [x[2] for x in bias_sim_pairs if x[0] == s1 and x[1] == s2][0]
+for target_label, sim_dict in [("COVERAGE", cov_sim), ("BIAS", bias_sim)]:
+    if not sim_dict:
+        continue
 
-    oo_cov_d = abs(proxy_df.loc[s1, 'OO_cov (CO/SL1)'] - proxy_df.loc[s2, 'OO_cov (CO/SL1)'])
-    oo_bias_d = abs(proxy_df.loc[s1, 'OO_bias (FC/CO)'] - proxy_df.loc[s2, 'OO_bias (FC/CO)'])
-    oo_fc_d = abs(proxy_df.loc[s1, 'OO/FC'] - proxy_df.loc[s2, 'OO/FC'])
+    within = [(p, v) for p, v in sim_dict.items()
+              if site_to_cust.get(p[0]) == site_to_cust.get(p[1])]
+    across = [(p, v) for p, v in sim_dict.items()
+              if site_to_cust.get(p[0]) != site_to_cust.get(p[1])]
 
-    def fmt(v):
-        return f"{v:.4f}" if not np.isnan(v) else "   NaN"
+    if within and across:
+        w_vals = [v for _, v in within]
+        a_vals = [v for _, v in across]
+        print(f"{target_label}:")
+        print(f"  Within-customer pairs: {len(within)}, "
+              f"mean similarity = {np.mean(w_vals):.3f}")
+        print(f"  Cross-customer pairs:  {len(across)}, "
+              f"mean similarity = {np.mean(a_vals):.3f}")
+        t, p = stats.mannwhitneyu(w_vals, a_vals, alternative='greater')
+        print(f"  Mann-Whitney U test (within > across): p = {p:.6f}")
 
-    print(f"{s1} — {s2:<20} {fmt(cr):>7} {fmt(br):>7} {fmt(oo_cov_d):>12} {fmt(oo_bias_d):>13} {fmt(oo_fc_d):>11}")
+        # Now test proxies within-customer only
+        print(f"\n  --- Proxy correlations (WITHIN-customer pairs only) ---")
+        within_pairs = [p for p, _ in within]
+        within_sim = np.array([v for _, v in within])
 
-print("\n" + "=" * 90)
-print("INTERPRETATION")
+        best_features = []
+        for col in proxy_cols:
+            proxy_dist = []
+            valid_mask = []
+            for s1, s2 in within_pairs:
+                v1 = proxy_df.loc[s1, col]
+                v2 = proxy_df.loc[s2, col]
+                d = abs(v1 - v2)
+                proxy_dist.append(d)
+                valid_mask.append(not np.isnan(d))
+            proxy_dist = np.array(proxy_dist)
+            valid_mask = np.array(valid_mask)
+            n = valid_mask.sum()
+            if n >= 10:
+                r, p = stats.spearmanr(proxy_dist[valid_mask], within_sim[valid_mask])
+                best_features.append((col, r, p, n))
+
+        best_features.sort(key=lambda x: x[1])
+        print(f"  {'Proxy':<20} {'Spearman r':>12} {'p-value':>12} {'N':>6}")
+        print(f"  {'-'*55}")
+        for col, r, p, n in best_features[:8]:
+            sig = " <<<" if (r < -0.3 and p < 0.05) else ""
+            print(f"  {col:<20} {r:>12.4f} {p:>12.6f} {n:>6}{sig}")
+        print()
+
+# ── 7. Summary ─────────────────────────────────────────────────────
+print("=" * 90)
+print("SUMMARY")
 print("=" * 90)
 print("""
-ALL proxy features use only data observable at forecast time:
-  - Historical_Sales_Lag1/12 (prior month sales)
-  - Open_Orders, Forecast_Value, Covered_Orders (current forecast data)
-  - Ratios derived from the above (NO Actual_Sales)
+Observable-at-forecast-time proxy features tested:
+  Raw:     sales_lag1, sales_lag12, open_orders, forecast_value,
+           covered_orders, covered_oo
+  Pre-computed: OO_Coverage (Covered_OO / Open_Orders),
+                OO_Bias (Forecast / Covered_OO)
+  Ratios:  FC/SL1, OO/SL1, CO/SL1, COO/SL1, OO/FC, COO/OO, FC/CO
 
-The ground truth (fc_coverage, fc_bias curves) uses Actual_Sales — that's
-what we're trying to predict. The question is whether the observable proxies
-can identify which sites will have similar curves.
+Ground truth: Coverage (Covered_Orders / Actual_Sales) and Bias curves
+at TF=12, across Lags 1–12.
 
-Negative Spearman r (< -0.3, p < 0.1) = sites with similar proxy values
-tend to have similar aging curves → approach is viable.
+Negative Spearman r (< -0.3, p < 0.05) = proxy distance predicts curve
+dissimilarity → approach viable.
 """)
 print("=" * 90)
 print("ANALYSIS COMPLETE")
