@@ -362,6 +362,54 @@ def print_per_lag(pred_df):
         w, n = _wmape(grp['Actual_Sales'], grp['Prediction'])
         print(f"    {lag:>4} {len(grp):>8,} {_fmt_wmape(w):>8} {_fmt_pct(_bias(grp['Actual_Sales'], grp['Prediction'])):>10}")
 
+def print_per_customer(pred_df, sort_key='fc_corr_bias'):
+    """Aggregate predictions by customer (GSA) across all snapshots.
+    Shows overall + FC_CORRECTED + FC_RAW + HIST per customer."""
+    print(f"\n  Per-Customer WMAPE / Bias  (sorted by |FC_Corrected bias|, largest first)")
+    hdr = (f"    {'Customer':<14} {'Rows':>6} {'Overall':>10} "
+           f"| {'FC_C n':>6} {'FC_C WMAPE':>11} {'FC_C Bias':>10} "
+           f"| {'FC_R n':>6} {'FC_R WMAPE':>11} {'FC_R Bias':>10} "
+           f"| {'HIST n':>6} {'HIST WMAPE':>11} {'HIST Bias':>10}")
+    print(hdr)
+    print(f"    {'-'*14} {'-'*6} {'-'*10} | {'-'*6} {'-'*11} {'-'*10} "
+          f"| {'-'*6} {'-'*11} {'-'*10} | {'-'*6} {'-'*11} {'-'*10}")
+
+    rows = []
+    for cust, grp in pred_df.groupby('GSA'):
+        fc_c = grp[grp['Prediction_Source'].isin(SOURCES_FC_CORRECTED)]
+        fc_r = grp[grp['Prediction_Source'].isin(SOURCES_FC_RAW)]
+        hist = grp[grp['Prediction_Source'] == 'HISTORICAL']
+        overall_w, _ = _wmape(grp['Actual_Sales'], grp['Prediction'])
+        overall_b = _bias(grp['Actual_Sales'], grp['Prediction'])
+        fc_c_w, _ = _wmape(fc_c['Actual_Sales'], fc_c['Prediction'])
+        fc_c_b = _bias(fc_c['Actual_Sales'], fc_c['Prediction'])
+        fc_r_w, _ = _wmape(fc_r['Actual_Sales'], fc_r['Prediction'])
+        fc_r_b = _bias(fc_r['Actual_Sales'], fc_r['Prediction'])
+        h_w, _ = _wmape(hist['Actual_Sales'], hist['Prediction'])
+        h_b = _bias(hist['Actual_Sales'], hist['Prediction'])
+        rows.append({
+            'cust': cust, 'rows': len(grp),
+            'overall_w': overall_w, 'overall_b': overall_b,
+            'fc_c_n': len(fc_c), 'fc_c_w': fc_c_w, 'fc_c_b': fc_c_b,
+            'fc_r_n': len(fc_r), 'fc_r_w': fc_r_w, 'fc_r_b': fc_r_b,
+            'h_n': len(hist), 'h_w': h_w, 'h_b': h_b,
+        })
+
+    # Sort by |FC_Corrected bias| desc, putting n/a at end
+    def sort_k(r):
+        v = r['fc_c_b']
+        if v is None or (isinstance(v, float) and np.isnan(v)):
+            return -1.0
+        return abs(v)
+    rows.sort(key=sort_k, reverse=True)
+
+    for r in rows:
+        print(f"    {r['cust']:<14} {r['rows']:>6,} "
+              f"{_fmt_wmape(r['overall_w']):>4}/{_fmt_pct(r['overall_b']):<5} | "
+              f"{r['fc_c_n']:>6,} {_fmt_wmape(r['fc_c_w']):>11} {_fmt_pct(r['fc_c_b']):>10} | "
+              f"{r['fc_r_n']:>6,} {_fmt_wmape(r['fc_r_w']):>11} {_fmt_pct(r['fc_r_b']):>10} | "
+              f"{r['h_n']:>6,} {_fmt_wmape(r['h_w']):>11} {_fmt_pct(r['h_b']):>10}")
+
 # ============================================================
 # CLI
 # ============================================================
@@ -435,10 +483,11 @@ def main():
             'hist_bias': metrics['HIST']['bias'],
             'no_pred_n': metrics['NO_PREDICTION']['rows'],
         })
-        if args.save_predictions:
-            pred_df = pred_df.copy()
-            pred_df['Snapshot'] = snap
-            all_preds.append(pred_df)
+        # Keep a slim copy of predictions for cross-snapshot aggregations
+        slim = pred_df[['GSA', 'gsa_site', 'Prediction_Lag', 'Timeframe',
+                        'Actual_Sales', 'Prediction', 'Prediction_Source']].copy()
+        slim['Snapshot'] = snap
+        all_preds.append(slim)
 
     if len(grid_summary) > 1:
         print("\n" + "=" * 100)
@@ -485,10 +534,17 @@ def main():
               f"FC_Raw={_mean('fc_raw_bias')*100:+.2f}%   "
               f"HIST={_mean('hist_bias')*100:+.2f}%")
 
-    if args.save_predictions and all_preds:
-        out = pd.concat(all_preds, ignore_index=True)
-        out.to_csv(args.save_predictions, index=False)
-        print(f"\nWrote per-row predictions to {args.save_predictions}")
+    # Per-customer aggregation across all snapshots
+    if all_preds:
+        combined = pd.concat(all_preds, ignore_index=True)
+        print("\n" + "=" * 100)
+        print("Per-customer summary across all snapshots")
+        print("=" * 100)
+        print_per_customer(combined)
+
+        if args.save_predictions:
+            combined.to_csv(args.save_predictions, index=False)
+            print(f"\nWrote per-row predictions to {args.save_predictions}")
 
 if __name__ == '__main__':
     main()
