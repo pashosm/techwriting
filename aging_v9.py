@@ -381,6 +381,15 @@ def main():
             if args.snapshot:  # detailed breakdowns only for single snapshot
                 print_per_site(pred_df)
                 print_per_lag(pred_df)
+
+        # Split by signal basis: FC (multi + single) vs HIST
+        fc_rows = pred_df[pred_df['Prediction_Source'].isin(['FC_MULTI', 'FC_SINGLE'])]
+        hist_rows = pred_df[pred_df['Prediction_Source'] == 'HISTORICAL']
+        fc_wmape, fc_n = _wmape(fc_rows['Actual_Sales'], fc_rows['Prediction'])
+        fc_bias = _bias(fc_rows['Actual_Sales'], fc_rows['Prediction'])
+        hist_wmape, hist_n = _wmape(hist_rows['Actual_Sales'], hist_rows['Prediction'])
+        hist_bias_v = _bias(hist_rows['Actual_Sales'], hist_rows['Prediction'])
+
         grid_summary.append({
             'snapshot': snap,
             'wmape': metrics['overall']['wmape'],
@@ -390,6 +399,12 @@ def main():
             'fc_single_n': metrics['FC_SINGLE']['n'],
             'historical_n': metrics['HISTORICAL']['n'],
             'no_pred_n': metrics['NO_PREDICTION']['rows'],
+            'fc_rows': len(fc_rows),
+            'fc_wmape': fc_wmape,
+            'fc_bias': fc_bias,
+            'hist_rows': len(hist_rows),
+            'hist_wmape': hist_wmape,
+            'hist_bias': hist_bias_v,
         })
         if args.save_predictions:
             pred_df = pred_df.copy()
@@ -398,7 +413,7 @@ def main():
 
     if len(grid_summary) > 1:
         print("\n" + "=" * 90)
-        print("Snapshot grid summary")
+        print("Snapshot grid summary (overall)")
         print("=" * 90)
         print(f"  {'Snapshot':<12} {'Rows':>8} {'WMAPE':>8} {'Bias':>10}  "
               f"{'FC_MULTI':>9} {'FC_SINGLE':>9} {'HIST':>8} {'NoPred':>7}")
@@ -407,12 +422,28 @@ def main():
                   f"{_fmt_pct(r['bias']):>10}  {r['fc_multi_n']:>9,} {r['fc_single_n']:>9,} "
                   f"{r['historical_n']:>8,} {r['no_pred_n']:>7,}")
 
+        print("\n" + "=" * 90)
+        print("Snapshot grid summary (split by signal basis: FC vs HIST)")
+        print("=" * 90)
+        print(f"  {'Snapshot':<12} | {'FC Rows':>8} {'FC WMAPE':>9} {'FC Bias':>10} "
+              f"| {'Hist Rows':>9} {'Hist WMAPE':>10} {'Hist Bias':>10}")
+        print(f"  {'-'*12}-+-{'-'*8} {'-'*9} {'-'*10}-+-{'-'*9} {'-'*10} {'-'*10}")
+        for r in grid_summary:
+            print(f"  {r['snapshot']:<12} | {r['fc_rows']:>8,} "
+                  f"{_fmt_wmape(r['fc_wmape']):>9} {_fmt_pct(r['fc_bias']):>10} "
+                  f"| {r['hist_rows']:>9,} "
+                  f"{_fmt_wmape(r['hist_wmape']):>10} {_fmt_pct(r['hist_bias']):>10}")
+
         # Aggregate (volume-weighted across snapshots)
-        wmapes = [r['wmape'] for r in grid_summary if r['wmape'] is not None and not np.isnan(r['wmape'])]
-        biases = [r['bias'] for r in grid_summary if r['bias'] is not None and not np.isnan(r['bias'])]
-        if wmapes:
-            print(f"\n  Mean WMAPE across snapshots: {np.mean(wmapes)*100:.2f}%")
-            print(f"  Mean Bias  across snapshots: {np.mean(biases)*100:+.2f}%")
+        def _mean(key):
+            vals = [r[key] for r in grid_summary
+                    if r[key] is not None and not np.isnan(r[key])]
+            return np.mean(vals) if vals else np.nan
+
+        print(f"\n  Mean WMAPE  overall={_mean('wmape')*100:.2f}%   "
+              f"FC={_mean('fc_wmape')*100:.2f}%   HIST={_mean('hist_wmape')*100:.2f}%")
+        print(f"  Mean Bias   overall={_mean('bias')*100:+.2f}%   "
+              f"FC={_mean('fc_bias')*100:+.2f}%   HIST={_mean('hist_bias')*100:+.2f}%")
 
     if args.save_predictions and all_preds:
         out = pd.concat(all_preds, ignore_index=True)
