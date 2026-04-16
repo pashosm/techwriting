@@ -18,3 +18,6 @@ _book
 # Python
 __pycache__/
 *.pyc
+
+# Large datasets (download from repo raw URL)
+training_data_anonymized.csv
