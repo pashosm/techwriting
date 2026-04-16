@@ -11,6 +11,18 @@ Point-in-time evaluation: at snapshot date T, the model only sees rows whose
 outcome was already known at T (Target_Period_End < T). Recent FC vintages
 (Reference_Month < T) remain available even when the cell has no history.
 
+Evaluation scope (Phase 1 narrowed):
+  - Universe:   Timeframe == 12  (applied globally on load)
+  - Test rows:  Prediction_Lag == 1  (applied when selecting test window)
+  - Registry:   NOT lag-filtered; keeps all vintages of tf=12 target periods so
+                lag-1 test rows can combine their own vintage with earlier-
+                published lag-2/3/.../N vintages for the same target period.
+
+Bias/coverage correction is only applied when the specific
+(gsa_site, Timeframe, Prediction_Lag) cell has >= MIN_OBS_FLAT=3 observations
+in completed, FC-bearing training data. Otherwise the vintage contributes
+raw (uncorrected) Forecast_Value to the multi-vintage combination.
+
 Usage:
   python aging_v9.py --snapshot 2024-12-01 --horizon 3
   python aging_v9.py --snapshot 2024-12-01 --horizon 3 --data path/to/file.csv
@@ -30,8 +42,14 @@ RECENCY_POWER = 2
 MIN_OBS_FLAT = 3
 VINTAGE_RECENCY_POWER = 1.5
 
-ALLOWED_LAGS = {1, 2, 3}
-ALLOWED_TIMEFRAMES = {3, 6, 9, 12}
+# Universe filter: applied in load_data. Every train/test/registry row must
+# satisfy this. tf=12 means we care only about 12-month target periods.
+UNIVERSE_TIMEFRAMES = {12}
+
+# Test filter: applied when selecting test rows inside run_snapshot. Registry
+# is NOT filtered by this - earlier-lag vintages of the same target period
+# must remain available to lag-1 test rows via multi-vintage combination.
+TEST_LAGS = {1}
 
 DEFAULT_DATA_PATH = 'training_data_anonymized.csv'
 
@@ -46,9 +64,8 @@ def load_data(path):
     )
     df['gsa_site'] = df['GSA'].astype(str) + '|' + df['Site'].astype(str)
 
-    # Phase 1 scope filters
-    df = df[df['Prediction_Lag'].isin(ALLOWED_LAGS)].copy()
-    df = df[df['Timeframe'].isin(ALLOWED_TIMEFRAMES)].copy()
+    # Universe filter
+    df = df[df['Timeframe'].isin(UNIVERSE_TIMEFRAMES)].copy()
 
     # Derived ratios for curve building
     df['fc_coverage'] = np.where(df['Actual_Sales'] > 0,
@@ -59,13 +76,14 @@ def load_data(path):
 
 # ============================================================
 # Curve building (flat only, no LT/OE conditioning)
+# Primary cell (gs, tf, lag) only. No pooled ('FB', gs, lag) fallback.
 # ============================================================
 def _recency_weights(ref_months):
     days = (ref_months - ref_months.min()).dt.days / 365
     return (1 + days.values) ** RECENCY_POWER
 
 def build_flat_curves(train_df, ratio_col):
-    """{(gs, tf, lag): val} primary + {('FB', gs, lag): val} pooled fallback."""
+    """{(gs, tf, lag): val} at MIN_OBS_FLAT=3. No site-level fallback."""
     curve = {}
     for (gs, tf, lag), grp in train_df.groupby(['gsa_site', 'Timeframe', 'Prediction_Lag']):
         valid = grp[grp[ratio_col].notna() & (grp[ratio_col] > 0) & (grp[ratio_col] < 10)]
@@ -73,17 +91,12 @@ def build_flat_curves(train_df, ratio_col):
             continue
         wts = _recency_weights(valid['Reference_Month'])
         curve[(gs, tf, lag)] = np.average(valid[ratio_col], weights=wts)
-
-    for (gs, lag), grp in train_df.groupby(['gsa_site', 'Prediction_Lag']):
-        valid = grp[grp[ratio_col].notna() & (grp[ratio_col] > 0) & (grp[ratio_col] < 10)]
-        if len(valid) < MIN_OBS_FLAT:
-            continue
-        wts = _recency_weights(valid['Reference_Month'])
-        curve[('FB', gs, lag)] = np.average(valid[ratio_col], weights=wts)
     return curve
 
 def build_historical(train_df):
-    """{(gs, tf): recency-weighted mean Actual_Sales} + {('FB', gs): pooled}."""
+    """{(gs, tf): recency-weighted mean Actual_Sales} + {('FB', gs): pooled}.
+    Historical fallback keeps its site-level pool: it's an independent signal,
+    not a correction curve."""
     hist = {}
     for (gs, tf), grp in train_df.groupby(['gsa_site', 'Timeframe']):
         valid = grp[grp['Actual_Sales'].notna() & (grp['Actual_Sales'] > 0)]
@@ -122,17 +135,20 @@ def build_forecast_registry(data_df):
     return registry
 
 def _vintage_to_estimate(vintage, cov_curve, bias_curve):
+    """Returns (estimate, valid, corrected).
+    corrected=True iff the specific (gs, tf, lag) cell had a curve (>= MIN_OBS_FLAT
+    completed+FC-bearing training obs). No fallback key is consulted.
+    When no cell curve exists, returns raw fc_value with corrected=False."""
     gs, tf, lag = vintage['gsa_site'], vintage['timeframe'], vintage['lag']
     fc_val = vintage['fc_value']
     if fc_val <= 0:
-        return np.nan, False
-    for key in [(gs, tf, lag), ('FB', gs, lag)]:
-        cf = cov_curve.get(key)
-        bf = bias_curve.get(key)
-        if cf and bf and cf > 0.001 and bf > 0.001:
-            return fc_val / bf / cf, True
-    # No curve available -> raw FC (treated as identity correction)
-    return fc_val, True
+        return np.nan, False, False
+    key = (gs, tf, lag)
+    cf = cov_curve.get(key)
+    bf = bias_curve.get(key)
+    if cf and bf and cf > 0.001 and bf > 0.001:
+        return fc_val / bf / cf, True, True
+    return fc_val, True, False
 
 def _combine_vintage_estimates(estimates_with_lags):
     if not estimates_with_lags:
@@ -147,15 +163,21 @@ def _combine_vintage_estimates(estimates_with_lags):
 # ============================================================
 # Prediction
 # ============================================================
+SOURCES_FC_CORRECTED = {'FC_MULTI_CORRECTED', 'FC_SINGLE_CORRECTED'}
+SOURCES_FC_RAW = {'FC_MULTI_RAW', 'FC_SINGLE_RAW'}
+SOURCES_FC_ANY = SOURCES_FC_CORRECTED | SOURCES_FC_RAW
+ALL_SOURCES = ['FC_MULTI_CORRECTED', 'FC_MULTI_RAW',
+               'FC_SINGLE_CORRECTED', 'FC_SINGLE_RAW', 'HISTORICAL']
+
 def predict(test_df, cov_curve, bias_curve, hist, registry):
-    """For each test row, pick first available source:
-       FC_MULTI -> FC_SINGLE -> HISTORICAL.
-       Returns test_df with [Prediction, Prediction_Source, N_Vintages]."""
+    """For each test row: combine all available vintages of its target period
+    (with ref_month <= test.Reference_Month and fc_value > 0). Label source by
+    (multi vs single) x (at least one corrected vs all raw), else HISTORICAL."""
     n = len(test_df)
     preds = np.full(n, np.nan)
     sources = np.empty(n, dtype=object)
     n_vint = np.zeros(n, dtype=int)
-    has_curve_correction = np.zeros(n, dtype=bool)
+    n_corrected_vint = np.zeros(n, dtype=int)
 
     for i, (_, row) in enumerate(test_df.iterrows()):
         gs = row['gsa_site']
@@ -163,31 +185,26 @@ def predict(test_df, cov_curve, bias_curve, hist, registry):
         ref_m = row['Reference_Month']
         tp_key = (gs, row['Target_Period_Start'], row['Target_Period_End'])
 
-        # Try FC (multi or single vintage)
         if tp_key in registry:
             valid = []
             for v in registry[tp_key]:
                 if v['ref_month'] > ref_m:  # temporal causality
                     continue
-                est, ok = _vintage_to_estimate(v, cov_curve, bias_curve)
+                est, ok, corrected = _vintage_to_estimate(v, cov_curve, bias_curve)
                 if ok:
-                    # Track whether we used a curve (vs raw FC)
-                    used_curve = (gs, v['timeframe'], v['lag']) in cov_curve or \
-                                 ('FB', gs, v['lag']) in cov_curve
-                    valid.append((max(est, 0), v['lag'], used_curve))
+                    valid.append((max(est, 0), v['lag'], corrected))
 
-            if len(valid) >= 2:
-                preds[i] = max(_combine_vintage_estimates(
-                    [(e, l) for e, l, _ in valid]), 0)
-                sources[i] = 'FC_MULTI'
+            if valid:
                 n_vint[i] = len(valid)
-                has_curve_correction[i] = any(uc for _, _, uc in valid)
-                continue
-            if len(valid) == 1:
-                preds[i] = valid[0][0]
-                sources[i] = 'FC_SINGLE'
-                n_vint[i] = 1
-                has_curve_correction[i] = valid[0][2]
+                n_corrected_vint[i] = sum(1 for _, _, c in valid if c)
+                combined = max(_combine_vintage_estimates(
+                    [(e, l) for e, l, _ in valid]), 0)
+                preds[i] = combined
+                any_corrected = n_corrected_vint[i] > 0
+                if len(valid) >= 2:
+                    sources[i] = 'FC_MULTI_CORRECTED' if any_corrected else 'FC_MULTI_RAW'
+                else:
+                    sources[i] = 'FC_SINGLE_CORRECTED' if any_corrected else 'FC_SINGLE_RAW'
                 continue
 
         # Historical fallback
@@ -200,7 +217,8 @@ def predict(test_df, cov_curve, bias_curve, hist, registry):
     out['Prediction'] = preds
     out['Prediction_Source'] = sources
     out['N_Vintages'] = n_vint
-    out['Curve_Corrected'] = has_curve_correction
+    out['N_Corrected_Vintages'] = n_corrected_vint
+    out['Curve_Corrected'] = n_corrected_vint > 0
     return out
 
 # ============================================================
@@ -222,27 +240,30 @@ def _bias(actual, pred):
         return np.nan
     return float((np.sum(p[mask]) - np.sum(a[mask])) / np.sum(a[mask]))
 
+def _metric_block(sub):
+    w, n = _wmape(sub['Actual_Sales'], sub['Prediction'])
+    return {
+        'wmape': w,
+        'bias': _bias(sub['Actual_Sales'], sub['Prediction']),
+        'n': n,
+        'rows': len(sub),
+    }
+
 def score(pred_df):
-    metrics = {}
-    overall_w, overall_n = _wmape(pred_df['Actual_Sales'], pred_df['Prediction'])
-    metrics['overall'] = {
-        'wmape': overall_w,
-        'bias': _bias(pred_df['Actual_Sales'], pred_df['Prediction']),
-        'n': overall_n,
-        'rows': len(pred_df),
-    }
-    for src in ['FC_MULTI', 'FC_SINGLE', 'HISTORICAL']:
-        sub = pred_df[pred_df['Prediction_Source'] == src]
-        w, n = _wmape(sub['Actual_Sales'], sub['Prediction'])
-        metrics[src] = {
-            'wmape': w,
-            'bias': _bias(sub['Actual_Sales'], sub['Prediction']),
-            'n': n,
-            'rows': len(sub),
-        }
-    metrics['NO_PREDICTION'] = {
-        'rows': int(pred_df['Prediction'].isna().sum()),
-    }
+    metrics = {'overall': _metric_block(pred_df)}
+    # 5-level source detail
+    for src in ALL_SOURCES:
+        metrics[src] = _metric_block(pred_df[pred_df['Prediction_Source'] == src])
+    # 3-level rollup (FC_CORRECTED / FC_RAW / HIST)
+    metrics['FC_CORRECTED'] = _metric_block(
+        pred_df[pred_df['Prediction_Source'].isin(SOURCES_FC_CORRECTED)])
+    metrics['FC_RAW'] = _metric_block(
+        pred_df[pred_df['Prediction_Source'].isin(SOURCES_FC_RAW)])
+    metrics['FC_ANY'] = _metric_block(
+        pred_df[pred_df['Prediction_Source'].isin(SOURCES_FC_ANY)])
+    metrics['HIST'] = _metric_block(
+        pred_df[pred_df['Prediction_Source'] == 'HISTORICAL'])
+    metrics['NO_PREDICTION'] = {'rows': int(pred_df['Prediction'].isna().sum())}
     return metrics
 
 # ============================================================
@@ -256,27 +277,35 @@ def run_snapshot(df, snapshot_date, horizon_months, verbose=True):
     # Train: outcome already known by snapshot
     train = df[df['Target_Period_End'] < snap].copy()
 
-    # Test: target window starts in [snap, snap+horizon), ref_month strictly before snap
+    # Test: target window starts in [snap, snap+horizon), ref_month strictly
+    # before snap, and only the lag(s) we care about.
     test = df[
         (df['Target_Period_Start'] >= snap) &
         (df['Target_Period_Start'] < horizon_end) &
-        (df['Reference_Month'] < snap)
+        (df['Reference_Month'] < snap) &
+        (df['Prediction_Lag'].isin(TEST_LAGS))
     ].copy()
 
-    # Registry: any FC vintage with ref_month < snap (recent vintages OK even with no history)
+    # Registry: any FC vintage with ref_month < snap (all lags).
     visible = df[df['Reference_Month'] < snap]
+
+    # Curves: completed + FC-bearing training data only.
+    curve_train = train[train['Has_Forecast'] == 1]
 
     if verbose:
         print(f"\n  Snapshot {snap.date()} (horizon {horizon_months}mo):")
-        print(f"    Train rows (outcomes known): {len(train):,}")
-        print(f"    Test rows (in horizon):      {len(test):,}")
-        print(f"    Visible FC-bearing rows:     {int((visible['Has_Forecast']==1).sum()):,}")
+        print(f"    Train rows (outcomes known):      {len(train):,}")
+        print(f"    Curve train rows (Has_Forecast=1): {len(curve_train):,}")
+        print(f"    Test rows (tf={sorted(UNIVERSE_TIMEFRAMES)}, lag={sorted(TEST_LAGS)}): "
+              f"{len(test):,}")
+        print(f"    Visible FC-bearing rows (all lags): "
+              f"{int((visible['Has_Forecast']==1).sum()):,}")
 
     if len(train) == 0 or len(test) == 0:
         return None, None
 
-    cov_curve = build_flat_curves(train, 'fc_coverage')
-    bias_curve = build_flat_curves(train, 'fc_bias')
+    cov_curve = build_flat_curves(curve_train, 'fc_coverage')
+    bias_curve = build_flat_curves(curve_train, 'fc_bias')
     hist = build_historical(train)
     registry = build_forecast_registry(visible)
 
@@ -299,13 +328,20 @@ def _fmt_wmape(x):
 
 def print_metrics(metrics, snapshot_date):
     print(f"\n  Results for snapshot {snapshot_date}:")
-    print(f"    {'Source':<14} {'Rows':>8} {'WMAPE':>8} {'Bias':>10}")
-    print(f"    {'-'*14} {'-'*8} {'-'*8} {'-'*10}")
-    for src in ['overall', 'FC_MULTI', 'FC_SINGLE', 'HISTORICAL']:
+    print(f"    {'Source':<24} {'Rows':>8} {'WMAPE':>8} {'Bias':>10}")
+    print(f"    {'-'*24} {'-'*8} {'-'*8} {'-'*10}")
+    # 3-level rollup first
+    for src in ['overall', 'FC_CORRECTED', 'FC_RAW', 'FC_ANY', 'HIST']:
         m = metrics[src]
-        rows = m.get('rows', 0)
-        print(f"    {src:<14} {rows:>8,} {_fmt_wmape(m.get('wmape')):>8} {_fmt_pct(m.get('bias')):>10}")
-    print(f"    {'NO_PREDICTION':<14} {metrics['NO_PREDICTION']['rows']:>8,}")
+        print(f"    {src:<24} {m.get('rows',0):>8,} "
+              f"{_fmt_wmape(m.get('wmape')):>8} {_fmt_pct(m.get('bias')):>10}")
+    print(f"    {'-'*24}")
+    # 5-level detail
+    for src in ALL_SOURCES:
+        m = metrics[src]
+        print(f"    {src:<24} {m.get('rows',0):>8,} "
+              f"{_fmt_wmape(m.get('wmape')):>8} {_fmt_pct(m.get('bias')):>10}")
+    print(f"    {'NO_PREDICTION':<24} {metrics['NO_PREDICTION']['rows']:>8,}")
 
 def print_per_site(pred_df, top=15):
     print(f"\n  Per-site WMAPE (top {top} by row count):")
@@ -360,7 +396,8 @@ def main():
     print("V9 Phase 1: Pure FC Model - Point-in-Time Evaluation")
     print("=" * 90)
     print(f"Data: {args.data}")
-    print(f"Filters: Prediction_Lag in {sorted(ALLOWED_LAGS)}, Timeframe in {sorted(ALLOWED_TIMEFRAMES)}")
+    print(f"Universe: Timeframe in {sorted(UNIVERSE_TIMEFRAMES)}   "
+          f"Test: Prediction_Lag in {sorted(TEST_LAGS)}")
 
     df = load_data(args.data)
     print(f"Loaded {len(df):,} rows after filters across {df['gsa_site'].nunique()} sites")
@@ -382,29 +419,21 @@ def main():
                 print_per_site(pred_df)
                 print_per_lag(pred_df)
 
-        # Split by signal basis: FC (multi + single) vs HIST
-        fc_rows = pred_df[pred_df['Prediction_Source'].isin(['FC_MULTI', 'FC_SINGLE'])]
-        hist_rows = pred_df[pred_df['Prediction_Source'] == 'HISTORICAL']
-        fc_wmape, fc_n = _wmape(fc_rows['Actual_Sales'], fc_rows['Prediction'])
-        fc_bias = _bias(fc_rows['Actual_Sales'], fc_rows['Prediction'])
-        hist_wmape, hist_n = _wmape(hist_rows['Actual_Sales'], hist_rows['Prediction'])
-        hist_bias_v = _bias(hist_rows['Actual_Sales'], hist_rows['Prediction'])
-
         grid_summary.append({
             'snapshot': snap,
             'wmape': metrics['overall']['wmape'],
             'bias': metrics['overall']['bias'],
             'rows': metrics['overall']['rows'],
-            'fc_multi_n': metrics['FC_MULTI']['n'],
-            'fc_single_n': metrics['FC_SINGLE']['n'],
-            'historical_n': metrics['HISTORICAL']['n'],
+            'fc_corrected_rows': metrics['FC_CORRECTED']['rows'],
+            'fc_corrected_wmape': metrics['FC_CORRECTED']['wmape'],
+            'fc_corrected_bias': metrics['FC_CORRECTED']['bias'],
+            'fc_raw_rows': metrics['FC_RAW']['rows'],
+            'fc_raw_wmape': metrics['FC_RAW']['wmape'],
+            'fc_raw_bias': metrics['FC_RAW']['bias'],
+            'hist_rows': metrics['HIST']['rows'],
+            'hist_wmape': metrics['HIST']['wmape'],
+            'hist_bias': metrics['HIST']['bias'],
             'no_pred_n': metrics['NO_PREDICTION']['rows'],
-            'fc_rows': len(fc_rows),
-            'fc_wmape': fc_wmape,
-            'fc_bias': fc_bias,
-            'hist_rows': len(hist_rows),
-            'hist_wmape': hist_wmape,
-            'hist_bias': hist_bias_v,
         })
         if args.save_predictions:
             pred_df = pred_df.copy()
@@ -412,38 +441,49 @@ def main():
             all_preds.append(pred_df)
 
     if len(grid_summary) > 1:
-        print("\n" + "=" * 90)
-        print("Snapshot grid summary (overall)")
-        print("=" * 90)
+        print("\n" + "=" * 100)
+        print("Snapshot grid summary (overall row counts)")
+        print("=" * 100)
         print(f"  {'Snapshot':<12} {'Rows':>8} {'WMAPE':>8} {'Bias':>10}  "
-              f"{'FC_MULTI':>9} {'FC_SINGLE':>9} {'HIST':>8} {'NoPred':>7}")
+              f"{'FC_Corr':>8} {'FC_Raw':>7} {'HIST':>7} {'NoPred':>7}")
         for r in grid_summary:
-            print(f"  {r['snapshot']:<12} {r['rows']:>8,} {_fmt_wmape(r['wmape']):>8} "
-                  f"{_fmt_pct(r['bias']):>10}  {r['fc_multi_n']:>9,} {r['fc_single_n']:>9,} "
-                  f"{r['historical_n']:>8,} {r['no_pred_n']:>7,}")
+            print(f"  {r['snapshot']:<12} {r['rows']:>8,} "
+                  f"{_fmt_wmape(r['wmape']):>8} {_fmt_pct(r['bias']):>10}  "
+                  f"{r['fc_corrected_rows']:>8,} {r['fc_raw_rows']:>7,} "
+                  f"{r['hist_rows']:>7,} {r['no_pred_n']:>7,}")
 
-        print("\n" + "=" * 90)
-        print("Snapshot grid summary (split by signal basis: FC vs HIST)")
-        print("=" * 90)
-        print(f"  {'Snapshot':<12} | {'FC Rows':>8} {'FC WMAPE':>9} {'FC Bias':>10} "
-              f"| {'Hist Rows':>9} {'Hist WMAPE':>10} {'Hist Bias':>10}")
-        print(f"  {'-'*12}-+-{'-'*8} {'-'*9} {'-'*10}-+-{'-'*9} {'-'*10} {'-'*10}")
+        print("\n" + "=" * 100)
+        print("Snapshot grid summary (signal basis: FC_Corrected vs FC_Raw vs HIST)")
+        print("=" * 100)
+        print(f"  {'Snapshot':<12} | {'FC_C Rows':>9} {'FC_C WMAPE':>10} {'FC_C Bias':>10} "
+              f"| {'FC_R Rows':>9} {'FC_R WMAPE':>10} {'FC_R Bias':>10} "
+              f"| {'HIST Rows':>9} {'HIST WMAPE':>10} {'HIST Bias':>10}")
         for r in grid_summary:
-            print(f"  {r['snapshot']:<12} | {r['fc_rows']:>8,} "
-                  f"{_fmt_wmape(r['fc_wmape']):>9} {_fmt_pct(r['fc_bias']):>10} "
-                  f"| {r['hist_rows']:>9,} "
-                  f"{_fmt_wmape(r['hist_wmape']):>10} {_fmt_pct(r['hist_bias']):>10}")
+            print(f"  {r['snapshot']:<12} | "
+                  f"{r['fc_corrected_rows']:>9,} "
+                  f"{_fmt_wmape(r['fc_corrected_wmape']):>10} "
+                  f"{_fmt_pct(r['fc_corrected_bias']):>10} | "
+                  f"{r['fc_raw_rows']:>9,} "
+                  f"{_fmt_wmape(r['fc_raw_wmape']):>10} "
+                  f"{_fmt_pct(r['fc_raw_bias']):>10} | "
+                  f"{r['hist_rows']:>9,} "
+                  f"{_fmt_wmape(r['hist_wmape']):>10} "
+                  f"{_fmt_pct(r['hist_bias']):>10}")
 
-        # Aggregate (volume-weighted across snapshots)
+        # Aggregate across snapshots (simple mean of per-snapshot rates)
         def _mean(key):
             vals = [r[key] for r in grid_summary
                     if r[key] is not None and not np.isnan(r[key])]
             return np.mean(vals) if vals else np.nan
 
         print(f"\n  Mean WMAPE  overall={_mean('wmape')*100:.2f}%   "
-              f"FC={_mean('fc_wmape')*100:.2f}%   HIST={_mean('hist_wmape')*100:.2f}%")
+              f"FC_Corrected={_mean('fc_corrected_wmape')*100:.2f}%   "
+              f"FC_Raw={_mean('fc_raw_wmape')*100:.2f}%   "
+              f"HIST={_mean('hist_wmape')*100:.2f}%")
         print(f"  Mean Bias   overall={_mean('bias')*100:+.2f}%   "
-              f"FC={_mean('fc_bias')*100:+.2f}%   HIST={_mean('hist_bias')*100:+.2f}%")
+              f"FC_Corrected={_mean('fc_corrected_bias')*100:+.2f}%   "
+              f"FC_Raw={_mean('fc_raw_bias')*100:+.2f}%   "
+              f"HIST={_mean('hist_bias')*100:+.2f}%")
 
     if args.save_predictions and all_preds:
         out = pd.concat(all_preds, ignore_index=True)

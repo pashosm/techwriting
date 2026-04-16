@@ -484,3 +484,79 @@ The inverse-MAPE weighting mechanism (`w = 1/MAPE`) already handles the accuracy
 2. ~~**LT+OE affecting OO vs FC weighting**~~: Tested above. Marginal bias improvement only.
 3. ~~**FC-primary architecture**~~: Tested above. OO provides critical bias diversification; removing it degrades accuracy.
 4. **Older vintage analysis**: The multi-vintage model currently weights all vintages by `1/lag^1.5`. Older vintages (high original lag) may carry different signal quality — worth examining whether a staleness cap or different weighting at very high lags improves results.
+
+---
+
+## V9 (Phase 1): Pure FC Model with Point-in-Time Evaluation
+
+V9 simplifies the architecture around four principles:
+1. **Forecast (FC) is the only prediction signal** — no OO blending.
+2. **Fall back to historical sales when no FC is available**, clearly labeled.
+3. **Built on FC bias × FC coverage curves** (no LT/OE conditioning).
+4. **Regime detection at prediction time** — deferred to Phase 2.
+
+### Key files
+
+| File | Purpose |
+|------|---------|
+| `aging_v9.py` | V9 Phase 1 script: pure FC, point-in-time snapshot evaluation |
+| `training_data_anonymized.csv` | New larger dataset: 24 customers, ~420k rows (not committed — download via `curl`) |
+| `diag_fc_coverage.py` | Diagnostic: why FC row counts don't grow across snapshots |
+
+### Lag, Timeframe, Reference_Month — worked example
+
+A forecast row is indexed by:
+- **`gsa_site`** — the site.
+- **`Target_Period_Start` / `Target_Period_End`** — the window whose actual sales we're trying to predict.
+- **`Timeframe`** — duration of that window in months (`End - Start`).
+- **`Reference_Month`** — when the forecast was published.
+- **`Prediction_Lag`** — months between publication and target start. Lag 1 = forecast published 1 month before the window opens.
+
+The same target period typically appears in **multiple rows — one per vintage**. Each vintage has the same `Target_Period_Start` / `Target_Period_End` / `Timeframe`, but different `(Reference_Month, Prediction_Lag, Forecast_Value)`. `Actual_Sales` is the same across all vintages of the target period (it's the realized outcome).
+
+**Worked example** — target period Jan 2025 – Dec 2025 (`Timeframe = 12`):
+
+| Reference_Month | Prediction_Lag | Meaning |
+|---|---|---|
+| Dec 2024 | 1 | Forecast published 1 month before target opens |
+| Nov 2024 | 2 | Forecast published 2 months before target opens |
+| Oct 2024 | 3 | Forecast published 3 months before target opens |
+| … | … | … |
+
+### V9 scope (Phase 1)
+
+- **Universe filter (applied on load)**: `Timeframe == 12`. Everything the model sees is a 12-month target period.
+- **Test filter (applied at snapshot time)**: `Prediction_Lag == 1`. We evaluate 1-month-ahead predictions of 12-month windows first, then expand to other lags once this case is tuned.
+- **Registry is NOT lag-filtered**. A lag-1 test row can still combine its own vintage with any earlier-published lag-2 / lag-3 / … vintages of the same target period via `1 / lag^1.5` weighting. This is what "don't lose information" means in practice.
+
+### Point-in-time evaluation
+
+At snapshot date *T*:
+- **Training rows** (for curves and history): `Target_Period_End < T` — outcome was already known at *T*.
+- **Curve training** (for bias and coverage only): also `Has_Forecast == 1`. Rows without a forecast can't contribute to bias/coverage ratios.
+- **Test rows**: `Target_Period_Start ∈ [T, T + horizon)` and `Reference_Month < T` and `Prediction_Lag ∈ TEST_LAGS`.
+- **Registry**: all rows with `Has_Forecast == 1` and `Reference_Month < T`. This keeps recent vintages available even for target periods with no prior history.
+
+### Curve-correction gating
+
+Bias and coverage correction (`fc_implied = fc_value / bias / coverage`) is only applied when the specific `(gsa_site, Timeframe, Prediction_Lag)` cell has ≥ `MIN_OBS_FLAT = 3` observations in completed + FC-bearing training data. No pooled `('FB', site, lag)` fallback is used for correction — the historical-sales fallback keeps its own site-level pool, but that's a different signal.
+
+When no qualifying cell curve exists, the vintage contributes raw `Forecast_Value` to the multi-vintage combination, tagged as uncorrected. Error can then be measured separately for corrected vs raw FC:
+
+- `FC_MULTI_CORRECTED` / `FC_MULTI_RAW`: ≥2 vintages combined, at least one corrected vs all raw.
+- `FC_SINGLE_CORRECTED` / `FC_SINGLE_RAW`: 1 vintage, corrected vs raw.
+- `HISTORICAL`: no vintages available for this target period; use site-timeframe mean actual sales.
+
+### Usage
+
+```
+# Download data once
+curl -sL https://raw.githubusercontent.com/pashosm/techwriting/master/training_data_anonymized.csv \
+  -o training_data_anonymized.csv
+
+# Single snapshot
+python aging_v9.py --snapshot 2024-12-01 --horizon 3
+
+# Monthly grid
+python aging_v9.py --grid 2024-06-01:2025-03-01 --horizon 3 --quiet
+```
