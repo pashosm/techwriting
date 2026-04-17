@@ -41,6 +41,7 @@ warnings.filterwarnings('ignore')
 RECENCY_POWER = 2
 MIN_OBS_FLAT = 3
 VINTAGE_RECENCY_POWER = 1.5
+MAX_VINTAGE_LAG = 6
 
 # Universe filter: applied in load_data. Every train/test/registry row must
 # satisfy this. tf=12 means we care only about 12-month target periods.
@@ -207,6 +208,8 @@ def predict(test_df, cov_curve, bias_curve, hist, registry):
             excluded = 0
             for v in registry[tp_key]:
                 if v['ref_month'] > ref_m:
+                    continue
+                if v['lag'] > MAX_VINTAGE_LAG:
                     continue
                 if v['forecast_error']:
                     excluded += 1
