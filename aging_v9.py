@@ -1,11 +1,11 @@
 """
 V9 (Phase 1): Pure FC Model with Point-in-Time Evaluation
 ==========================================================
-Simplified architecture — four principles:
+Simplified architecture:
   1. FC is the only prediction signal
   2. Fall back to historical sales when no FC, label the source
-  3. Built on FC bias x FC coverage curves (no LT/OE conditioning)
-  4. Regime detection deferred to Phase 2
+  3. Built on FC bias x FC coverage curves, conditioned on site_regime
+  4. Vintages flagged forecast_error=True excluded before combination
 
 Point-in-time evaluation: at snapshot date T, the model only sees rows whose
 outcome was already known at T (Target_Period_End < T). Recent FC vintages
@@ -19,9 +19,9 @@ Evaluation scope (Phase 1 narrowed):
                 published lag-2/3/.../N vintages for the same target period.
 
 Bias/coverage correction is only applied when the specific
-(gsa_site, Timeframe, Prediction_Lag) cell has >= MIN_OBS_FLAT=3 observations
-in completed, FC-bearing training data. Otherwise the vintage contributes
-raw (uncorrected) Forecast_Value to the multi-vintage combination.
+(gsa_site, Timeframe, Prediction_Lag, site_regime) cell has >= MIN_OBS_FLAT=3
+observations in completed, FC-bearing training data. Otherwise the vintage
+contributes raw (uncorrected) Forecast_Value to the multi-vintage combination.
 
 Usage:
   python aging_v9.py --snapshot 2024-12-01 --horizon 3
@@ -41,11 +41,6 @@ warnings.filterwarnings('ignore')
 RECENCY_POWER = 2
 MIN_OBS_FLAT = 3
 VINTAGE_RECENCY_POWER = 1.5
-
-# OO shock detection: flag a vintage as unstable if its OO signals deviate
-# sharply from the training-period average for that site.
-OO_COV_DROP_THRESHOLD = 0.20   # flag if OO_Coverage dropped > 0.20 from training avg
-OO_BIAS_RATIO_THRESHOLD = 3.0  # flag if OO_Bias spiked > 3x training avg
 
 # Universe filter: applied in load_data. Every train/test/registry row must
 # satisfy this. tf=12 means we care only about 12-month target periods.
@@ -78,11 +73,14 @@ def load_data(path):
     df['fc_bias'] = np.where(df['Covered_Orders'] > 0,
                              df['Forecast_Value'] / df['Covered_Orders'], np.nan)
 
-    # OO_Coverage: fill NaN with 0 (missing = Covered_Open_Orders was 0)
-    if 'OO_Coverage' in df.columns:
-        df['OO_Coverage'] = df['OO_Coverage'].fillna(0.0)
-    if 'OO_Bias' in df.columns:
-        df['OO_Bias'] = df['OO_Bias'].fillna(0.0)
+    if 'site_regime' in df.columns:
+        df['site_regime'] = df['site_regime'].fillna(0.0)
+
+    if 'forecast_error' in df.columns:
+        df['forecast_error'] = df['forecast_error'].map(
+            {True: True, False: False, 'True': True, 'False': False}
+        ).fillna(False).astype(bool)
+
     return df
 
 # ============================================================
@@ -94,14 +92,15 @@ def _recency_weights(ref_months):
     return (1 + days.values) ** RECENCY_POWER
 
 def build_flat_curves(train_df, ratio_col):
-    """{(gs, tf, lag): val} at MIN_OBS_FLAT=3. No site-level fallback."""
+    """{(gs, tf, lag, regime): val} at MIN_OBS_FLAT=3. No site-level fallback."""
     curve = {}
-    for (gs, tf, lag), grp in train_df.groupby(['gsa_site', 'Timeframe', 'Prediction_Lag']):
+    for (gs, tf, lag, regime), grp in train_df.groupby(
+            ['gsa_site', 'Timeframe', 'Prediction_Lag', 'site_regime']):
         valid = grp[grp[ratio_col].notna() & (grp[ratio_col] > 0) & (grp[ratio_col] < 10)]
         if len(valid) < MIN_OBS_FLAT:
             continue
         wts = _recency_weights(valid['Reference_Month'])
-        curve[(gs, tf, lag)] = np.average(valid[ratio_col], weights=wts)
+        curve[(gs, tf, lag, regime)] = np.average(valid[ratio_col], weights=wts)
     return curve
 
 def build_historical(train_df):
@@ -124,42 +123,6 @@ def build_historical(train_df):
     return hist
 
 # ============================================================
-# OO training history (for shock detection)
-# ============================================================
-def build_oo_history(train_df):
-    """{gsa_site: {'oo_cov_avg': float, 'oo_bias_avg': float}}
-    Recency-weighted average of OO_Coverage and OO_Bias across all completed
-    training rows (not just FC-bearing). Zeros are included so sites with
-    intermittently empty order books have a low baseline rather than missing."""
-    oo_hist = {}
-    for gs, grp in train_df.groupby('gsa_site'):
-        if len(grp) < 2:
-            continue
-        wts = _recency_weights(grp['Reference_Month'])
-        oo_hist[gs] = {
-            'oo_cov_avg': np.average(grp['OO_Coverage'].values, weights=wts),
-            'oo_bias_avg': np.average(grp['OO_Bias'].values, weights=wts),
-        }
-    return oo_hist
-
-def _vintage_is_stable(vintage, oo_hist):
-    """Returns True if the vintage's OO signals are within acceptable range
-    of the training-period average. Returns True (pass) when no history exists."""
-    gs = vintage['gsa_site']
-    if gs not in oo_hist:
-        return True
-    hist = oo_hist[gs]
-    train_cov = hist['oo_cov_avg']
-    train_bias = hist['oo_bias_avg']
-    test_cov = vintage['oo_coverage']
-    test_bias = vintage['oo_bias']
-    if train_cov - test_cov > OO_COV_DROP_THRESHOLD:
-        return False
-    if train_bias > 0.01 and test_bias / train_bias > OO_BIAS_RATIO_THRESHOLD:
-        return False
-    return True
-
-# ============================================================
 # Multi-vintage forecast registry (mirrors V8g)
 # ============================================================
 def build_forecast_registry(data_df):
@@ -176,8 +139,8 @@ def build_forecast_registry(data_df):
             'covered_orders': row['Covered_Orders'],
             'timeframe': row['Timeframe'],
             'gsa_site': row['gsa_site'],
-            'oo_coverage': row.get('OO_Coverage', 0.0),
-            'oo_bias': row.get('OO_Bias', 0.0),
+            'site_regime': row['site_regime'],
+            'forecast_error': row['forecast_error'],
         })
     for key in registry:
         registry[key].sort(key=lambda v: v['lag'])
@@ -185,14 +148,15 @@ def build_forecast_registry(data_df):
 
 def _vintage_to_estimate(vintage, cov_curve, bias_curve):
     """Returns (estimate, valid, corrected).
-    corrected=True iff the specific (gs, tf, lag) cell had a curve (>= MIN_OBS_FLAT
-    completed+FC-bearing training obs). No fallback key is consulted.
-    When no cell curve exists, returns raw fc_value with corrected=False."""
+    corrected=True iff the specific (gs, tf, lag, regime) cell had a curve
+    (>= MIN_OBS_FLAT completed+FC-bearing training obs). No fallback key
+    is consulted. When no cell curve exists, returns raw fc_value."""
     gs, tf, lag = vintage['gsa_site'], vintage['timeframe'], vintage['lag']
+    regime = vintage['site_regime']
     fc_val = vintage['fc_value']
     if fc_val <= 0:
         return np.nan, False, False
-    key = (gs, tf, lag)
+    key = (gs, tf, lag, regime)
     cf = cov_curve.get(key)
     bf = bias_curve.get(key)
     if cf and bf and cf > 0.001 and bf > 0.001:
@@ -218,14 +182,13 @@ SOURCES_FC_ANY = SOURCES_FC_CORRECTED | SOURCES_FC_RAW
 ALL_SOURCES = ['FC_MULTI_CORRECTED', 'FC_MULTI_RAW',
                'FC_SINGLE_CORRECTED', 'FC_SINGLE_RAW', 'HISTORICAL']
 
-def predict(test_df, cov_curve, bias_curve, hist, registry, oo_hist=None):
+def predict(test_df, cov_curve, bias_curve, hist, registry):
     """For each test row: combine all available vintages of its target period
     (with ref_month <= test.Reference_Month and fc_value > 0).
 
-    OO shock detection: if oo_hist is provided, each vintage is checked against
-    the training-period OO baseline. Unstable vintages (coverage collapse or
-    bias spike) are excluded. Remaining vintages are combined as usual. If all
-    vintages are excluded, falls back to HISTORICAL."""
+    Vintages flagged with forecast_error=True are excluded. Remaining vintages
+    are combined as usual. If all vintages are excluded, falls back to
+    HISTORICAL."""
     n = len(test_df)
     preds = np.full(n, np.nan)
     sources = np.empty(n, dtype=object)
@@ -245,7 +208,7 @@ def predict(test_df, cov_curve, bias_curve, hist, registry, oo_hist=None):
             for v in registry[tp_key]:
                 if v['ref_month'] > ref_m:
                     continue
-                if oo_hist is not None and not _vintage_is_stable(v, oo_hist):
+                if v['forecast_error']:
                     excluded += 1
                     continue
                 est, ok, corrected = _vintage_to_estimate(v, cov_curve, bias_curve)
@@ -368,14 +331,12 @@ def run_snapshot(df, snapshot_date, horizon_months, verbose=True):
     bias_curve = build_flat_curves(curve_train, 'fc_bias')
     hist = build_historical(train)
     registry = build_forecast_registry(visible)
-    oo_hist = build_oo_history(train)
 
     if verbose:
         print(f"    Curves: cov={len(cov_curve):,}  bias={len(bias_curve):,}  hist={len(hist):,}")
         print(f"    Registry target-period keys: {len(registry):,}")
-        print(f"    OO history sites: {len(oo_hist):,}")
 
-    pred_df = predict(test, cov_curve, bias_curve, hist, registry, oo_hist)
+    pred_df = predict(test, cov_curve, bias_curve, hist, registry)
     metrics = score(pred_df)
     return metrics, pred_df
 
