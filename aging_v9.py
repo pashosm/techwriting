@@ -42,6 +42,8 @@ RECENCY_POWER = 2
 MIN_OBS_FLAT = 3
 VINTAGE_RECENCY_POWER = 1.5
 MAX_VINTAGE_LAG = 6
+CV_THRESHOLD = 0.50
+DIV_THRESHOLD = 0.50
 
 # Universe filter: applied in load_data. Every train/test/registry row must
 # satisfy this. tf=12 means we care only about 12-month target periods.
@@ -104,6 +106,31 @@ def build_flat_curves(train_df, ratio_col):
         curve[(gs, tf, lag, regime)] = np.average(valid[ratio_col], weights=wts)
     return curve
 
+def build_curve_stats(train_df):
+    """{(gs, tf, lag, regime): {'cv_bias': float, 'cv_cov': float, 'n': int}}.
+    Recency-weighted coefficient of variation for each cell's bias and coverage."""
+    stats = {}
+    for (gs, tf, lag, regime), grp in train_df.groupby(
+            ['gsa_site', 'Timeframe', 'Prediction_Lag', 'site_regime']):
+        bias_valid = grp[grp['fc_bias'].notna() & (grp['fc_bias'] > 0) & (grp['fc_bias'] < 10)]
+        cov_valid = grp[grp['fc_coverage'].notna() & (grp['fc_coverage'] > 0) & (grp['fc_coverage'] < 10)]
+        if len(bias_valid) < MIN_OBS_FLAT or len(cov_valid) < MIN_OBS_FLAT:
+            continue
+        bw = _recency_weights(bias_valid['Reference_Month'])
+        b_mean = np.average(bias_valid['fc_bias'], weights=bw)
+        b_var = np.average((bias_valid['fc_bias'].values - b_mean) ** 2, weights=bw)
+        cv_bias = np.sqrt(b_var) / b_mean if b_mean > 0.001 else np.nan
+
+        cw = _recency_weights(cov_valid['Reference_Month'])
+        c_mean = np.average(cov_valid['fc_coverage'], weights=cw)
+        c_var = np.average((cov_valid['fc_coverage'].values - c_mean) ** 2, weights=cw)
+        cv_cov = np.sqrt(c_var) / c_mean if c_mean > 0.001 else np.nan
+
+        stats[(gs, tf, lag, regime)] = {
+            'cv_bias': cv_bias, 'cv_cov': cv_cov, 'n': len(bias_valid),
+        }
+    return stats
+
 def build_historical(train_df):
     """{(gs, tf): recency-weighted mean Actual_Sales} + {('FB', gs): pooled}.
     Historical fallback keeps its site-level pool: it's an independent signal,
@@ -147,23 +174,30 @@ def build_forecast_registry(data_df):
         registry[key].sort(key=lambda v: v['lag'])
     return registry
 
-def _vintage_to_estimate(vintage, cov_curve, bias_curve):
-    """Returns (estimate, valid, corrected).
+def _vintage_to_estimate(vintage, cov_curve, bias_curve, curve_stats=None):
+    """Returns (estimate, valid, corrected, cell_cv).
     corrected=True iff the specific (gs, tf, lag, regime) cell had a curve
     (>= MIN_OBS_FLAT completed+FC-bearing training obs). No fallback key
     is consulted. When no cell curve exists, the vintage is skipped (valid=False)
-    since we don't know how to correct it."""
+    since we don't know how to correct it.
+    cell_cv = max(cv_bias, cv_cov) for the vintage's cell, or NaN."""
     gs, tf, lag = vintage['gsa_site'], vintage['timeframe'], vintage['lag']
     regime = vintage['site_regime']
     fc_val = vintage['fc_value']
     if fc_val <= 0:
-        return np.nan, False, False
+        return np.nan, False, False, np.nan
     key = (gs, tf, lag, regime)
     cf = cov_curve.get(key)
     bf = bias_curve.get(key)
     if cf and bf and cf > 0.001 and bf > 0.001:
-        return fc_val / bf / cf, True, True
-    return np.nan, False, False
+        cell_cv = np.nan
+        if curve_stats and key in curve_stats:
+            s = curve_stats[key]
+            cv_b = s['cv_bias'] if not np.isnan(s['cv_bias']) else 0.0
+            cv_c = s['cv_cov'] if not np.isnan(s['cv_cov']) else 0.0
+            cell_cv = max(cv_b, cv_c)
+        return fc_val / bf / cf, True, True, cell_cv
+    return np.nan, False, False, np.nan
 
 def _combine_vintage_estimates(estimates_with_lags):
     if not estimates_with_lags:
@@ -184,19 +218,24 @@ SOURCES_FC_ANY = SOURCES_FC_CORRECTED | SOURCES_FC_RAW
 ALL_SOURCES = ['FC_MULTI_CORRECTED', 'FC_MULTI_RAW',
                'FC_SINGLE_CORRECTED', 'FC_SINGLE_RAW', 'HISTORICAL']
 
-def predict(test_df, cov_curve, bias_curve, hist, registry):
+def predict(test_df, cov_curve, bias_curve, hist, registry, curve_stats=None):
     """For each test row: combine all available vintages of its target period
     (with ref_month <= test.Reference_Month and fc_value > 0).
 
     Vintages flagged with forecast_error=True are excluded. Remaining vintages
     are combined as usual. If all vintages are excluded, falls back to
-    HISTORICAL."""
+    HISTORICAL.
+
+    When curve_stats is provided, computes per-row confidence flags:
+    Curve_CV, FC_Hist_Divergence, Confidence_Flag."""
     n = len(test_df)
     preds = np.full(n, np.nan)
     sources = np.empty(n, dtype=object)
     n_vint = np.zeros(n, dtype=int)
     n_corrected_vint = np.zeros(n, dtype=int)
     n_excluded_vint = np.zeros(n, dtype=int)
+    curve_cvs = np.full(n, np.nan)
+    fc_hist_divs = np.full(n, np.nan)
 
     for i, (_, row) in enumerate(test_df.iterrows()):
         gs = row['gsa_site']
@@ -215,22 +254,39 @@ def predict(test_df, cov_curve, bias_curve, hist, registry):
                 if v['forecast_error']:
                     excluded += 1
                     continue
-                est, ok, corrected = _vintage_to_estimate(v, cov_curve, bias_curve)
+                est, ok, corrected, cell_cv = _vintage_to_estimate(
+                    v, cov_curve, bias_curve, curve_stats)
                 if ok:
-                    valid.append((max(est, 0), v['lag'], corrected))
+                    valid.append((max(est, 0), v['lag'], corrected, cell_cv))
 
             n_excluded_vint[i] = excluded
             if valid:
                 n_vint[i] = len(valid)
-                n_corrected_vint[i] = sum(1 for _, _, c in valid if c)
+                n_corrected_vint[i] = sum(1 for _, _, c, _ in valid if c)
                 combined = max(_combine_vintage_estimates(
-                    [(e, l) for e, l, _ in valid]), 0)
+                    [(e, l) for e, l, _, _ in valid]), 0)
                 preds[i] = combined
                 any_corrected = n_corrected_vint[i] > 0
                 if len(valid) >= 2:
                     sources[i] = 'FC_MULTI_CORRECTED' if any_corrected else 'FC_MULTI_RAW'
                 else:
                     sources[i] = 'FC_SINGLE_CORRECTED' if any_corrected else 'FC_SINGLE_RAW'
+
+                # Weighted-average CV across contributing vintages
+                cv_vals = [(cv, l) for _, l, _, cv in valid if not np.isnan(cv)]
+                if cv_vals:
+                    tw, tv = 0.0, 0.0
+                    for cv, l in cv_vals:
+                        w = 1.0 / (l ** VINTAGE_RECENCY_POWER)
+                        tw += w
+                        tv += w * cv
+                    curve_cvs[i] = tv / tw if tw > 0 else np.nan
+
+                # FC-vs-Historical divergence
+                h = hist.get((gs, tf), hist.get(('FB', gs)))
+                if h is not None and h > 0 and combined > 0:
+                    fc_hist_divs[i] = abs(combined - h) / h
+
                 continue
 
         # Historical fallback
@@ -246,6 +302,13 @@ def predict(test_df, cov_curve, bias_curve, hist, registry):
     out['N_Corrected_Vintages'] = n_corrected_vint
     out['N_Excluded_Vintages'] = n_excluded_vint
     out['Curve_Corrected'] = n_corrected_vint > 0
+    out['Curve_CV'] = curve_cvs
+    out['FC_Hist_Divergence'] = fc_hist_divs
+    is_fc = out['Prediction_Source'].isin(SOURCES_FC_CORRECTED)
+    high_risk = is_fc & (
+        (out['Curve_CV'] > CV_THRESHOLD) | (out['FC_Hist_Divergence'] > DIV_THRESHOLD))
+    out['Confidence_Flag'] = np.where(~is_fc, 'NO_FLAG',
+                                      np.where(high_risk, 'HIGH_RISK', 'NORMAL'))
     return out
 
 # ============================================================
@@ -291,6 +354,11 @@ def score(pred_df):
     metrics['HIST'] = _metric_block(
         pred_df[pred_df['Prediction_Source'] == 'HISTORICAL'])
     metrics['NO_PREDICTION'] = {'rows': int(pred_df['Prediction'].isna().sum())}
+    # Confidence flag breakdown (FC_CORRECTED only)
+    for flag in ['HIGH_RISK', 'NORMAL']:
+        metrics[f'FC_C_{flag}'] = _metric_block(
+            pred_df[(pred_df['Prediction_Source'].isin(SOURCES_FC_CORRECTED)) &
+                    (pred_df['Confidence_Flag'] == flag)])
     return metrics
 
 # ============================================================
@@ -333,14 +401,16 @@ def run_snapshot(df, snapshot_date, horizon_months, verbose=True):
 
     cov_curve = build_flat_curves(curve_train, 'fc_coverage')
     bias_curve = build_flat_curves(curve_train, 'fc_bias')
+    c_stats = build_curve_stats(curve_train)
     hist = build_historical(train)
     registry = build_forecast_registry(visible)
 
     if verbose:
-        print(f"    Curves: cov={len(cov_curve):,}  bias={len(bias_curve):,}  hist={len(hist):,}")
+        print(f"    Curves: cov={len(cov_curve):,}  bias={len(bias_curve):,}  "
+              f"stats={len(c_stats):,}  hist={len(hist):,}")
         print(f"    Registry target-period keys: {len(registry):,}")
 
-    pred_df = predict(test, cov_curve, bias_curve, hist, registry)
+    pred_df = predict(test, cov_curve, bias_curve, hist, registry, curve_stats=c_stats)
     metrics = score(pred_df)
     return metrics, pred_df
 
@@ -369,6 +439,13 @@ def print_metrics(metrics, snapshot_date):
         print(f"    {src:<24} {m.get('rows',0):>8,} "
               f"{_fmt_wmape(m.get('wmape')):>8} {_fmt_pct(m.get('bias')):>10}")
     print(f"    {'NO_PREDICTION':<24} {metrics['NO_PREDICTION']['rows']:>8,}")
+    # Confidence flag breakdown
+    print(f"    {'-'*24}")
+    print(f"    {'Confidence (FC_C only)':<24}")
+    for flag in ['FC_C_HIGH_RISK', 'FC_C_NORMAL']:
+        m = metrics.get(flag, {'rows': 0})
+        print(f"    {flag:<24} {m.get('rows',0):>8,} "
+              f"{_fmt_wmape(m.get('wmape')):>8} {_fmt_pct(m.get('bias')):>10}")
 
 def print_per_site(pred_df, top=15):
     print(f"\n  Per-site WMAPE (top {top} by row count):")
@@ -509,10 +586,17 @@ def main():
             'hist_wmape': metrics['HIST']['wmape'],
             'hist_bias': metrics['HIST']['bias'],
             'no_pred_n': metrics['NO_PREDICTION']['rows'],
+            'hr_rows': metrics['FC_C_HIGH_RISK']['rows'],
+            'hr_wmape': metrics['FC_C_HIGH_RISK']['wmape'],
+            'hr_bias': metrics['FC_C_HIGH_RISK']['bias'],
+            'nr_rows': metrics['FC_C_NORMAL']['rows'],
+            'nr_wmape': metrics['FC_C_NORMAL']['wmape'],
+            'nr_bias': metrics['FC_C_NORMAL']['bias'],
         })
         # Keep a slim copy of predictions for cross-snapshot aggregations
         slim = pred_df[['GSA', 'gsa_site', 'Prediction_Lag', 'Timeframe',
-                        'Actual_Sales', 'Prediction', 'Prediction_Source']].copy()
+                        'Actual_Sales', 'Prediction', 'Prediction_Source',
+                        'Confidence_Flag']].copy()
         slim['Snapshot'] = snap
         all_preds.append(slim)
 
@@ -546,6 +630,23 @@ def main():
                   f"{_fmt_wmape(r['hist_wmape']):>10} "
                   f"{_fmt_pct(r['hist_bias']):>10}")
 
+        print("\n" + "=" * 100)
+        print(f"Confidence flag breakdown (FC_Corrected only, CV>{CV_THRESHOLD} or Div>{DIV_THRESHOLD})")
+        print("=" * 100)
+        print(f"  {'Snapshot':<12} | {'HIGH_RISK':>9} {'HR WMAPE':>9} {'HR Bias':>9} "
+              f"| {'NORMAL':>9} {'NR WMAPE':>9} {'NR Bias':>9} "
+              f"| {'Separation':>11}")
+        for r in grid_summary:
+            hr_w = r['hr_wmape']
+            nr_w = r['nr_wmape']
+            sep = (hr_w - nr_w) if (hr_w is not None and nr_w is not None
+                   and not np.isnan(hr_w) and not np.isnan(nr_w)) else np.nan
+            sep_s = f"{sep*100:+.1f}pp" if not np.isnan(sep) else "  n/a"
+            print(f"  {r['snapshot']:<12} | "
+                  f"{r['hr_rows']:>9,} {_fmt_wmape(r['hr_wmape']):>9} {_fmt_pct(r['hr_bias']):>9} | "
+                  f"{r['nr_rows']:>9,} {_fmt_wmape(r['nr_wmape']):>9} {_fmt_pct(r['nr_bias']):>9} | "
+                  f"{sep_s:>11}")
+
         # Aggregate across snapshots (simple mean of per-snapshot rates)
         def _mean(key):
             vals = [r[key] for r in grid_summary
@@ -560,6 +661,9 @@ def main():
               f"FC_Corrected={_mean('fc_corrected_bias')*100:+.2f}%   "
               f"FC_Raw={_mean('fc_raw_bias')*100:+.2f}%   "
               f"HIST={_mean('hist_bias')*100:+.2f}%")
+        print(f"  Mean WMAPE  HIGH_RISK={_mean('hr_wmape')*100:.2f}%   "
+              f"NORMAL={_mean('nr_wmape')*100:.2f}%   "
+              f"Separation={(_mean('hr_wmape')-_mean('nr_wmape'))*100:+.2f}pp")
 
     # Per-customer aggregation across all snapshots
     if all_preds:
