@@ -151,7 +151,8 @@ def _vintage_to_estimate(vintage, cov_curve, bias_curve):
     """Returns (estimate, valid, corrected).
     corrected=True iff the specific (gs, tf, lag, regime) cell had a curve
     (>= MIN_OBS_FLAT completed+FC-bearing training obs). No fallback key
-    is consulted. When no cell curve exists, returns raw fc_value."""
+    is consulted. When no cell curve exists, the vintage is skipped (valid=False)
+    since we don't know how to correct it."""
     gs, tf, lag = vintage['gsa_site'], vintage['timeframe'], vintage['lag']
     regime = vintage['site_regime']
     fc_val = vintage['fc_value']
@@ -162,7 +163,7 @@ def _vintage_to_estimate(vintage, cov_curve, bias_curve):
     bf = bias_curve.get(key)
     if cf and bf and cf > 0.001 and bf > 0.001:
         return fc_val / bf / cf, True, True
-    return fc_val, True, False
+    return np.nan, False, False
 
 def _combine_vintage_estimates(estimates_with_lags):
     if not estimates_with_lags:
