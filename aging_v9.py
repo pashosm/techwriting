@@ -42,6 +42,11 @@ RECENCY_POWER = 2
 MIN_OBS_FLAT = 3
 VINTAGE_RECENCY_POWER = 1.5
 
+# OO shock detection: flag a vintage as unstable if its OO signals deviate
+# sharply from the training-period average for that site.
+OO_COV_DROP_THRESHOLD = 0.20   # flag if OO_Coverage dropped > 0.20 from training avg
+OO_BIAS_RATIO_THRESHOLD = 3.0  # flag if OO_Bias spiked > 3x training avg
+
 # Universe filter: applied in load_data. Every train/test/registry row must
 # satisfy this. tf=12 means we care only about 12-month target periods.
 UNIVERSE_TIMEFRAMES = {12}
@@ -72,6 +77,12 @@ def load_data(path):
                                  df['Covered_Orders'] / df['Actual_Sales'], np.nan)
     df['fc_bias'] = np.where(df['Covered_Orders'] > 0,
                              df['Forecast_Value'] / df['Covered_Orders'], np.nan)
+
+    # OO_Coverage: fill NaN with 0 (missing = Covered_Open_Orders was 0)
+    if 'OO_Coverage' in df.columns:
+        df['OO_Coverage'] = df['OO_Coverage'].fillna(0.0)
+    if 'OO_Bias' in df.columns:
+        df['OO_Bias'] = df['OO_Bias'].fillna(0.0)
     return df
 
 # ============================================================
@@ -113,6 +124,42 @@ def build_historical(train_df):
     return hist
 
 # ============================================================
+# OO training history (for shock detection)
+# ============================================================
+def build_oo_history(train_df):
+    """{gsa_site: {'oo_cov_avg': float, 'oo_bias_avg': float}}
+    Recency-weighted average of OO_Coverage and OO_Bias across all completed
+    training rows (not just FC-bearing). Zeros are included so sites with
+    intermittently empty order books have a low baseline rather than missing."""
+    oo_hist = {}
+    for gs, grp in train_df.groupby('gsa_site'):
+        if len(grp) < 2:
+            continue
+        wts = _recency_weights(grp['Reference_Month'])
+        oo_hist[gs] = {
+            'oo_cov_avg': np.average(grp['OO_Coverage'].values, weights=wts),
+            'oo_bias_avg': np.average(grp['OO_Bias'].values, weights=wts),
+        }
+    return oo_hist
+
+def _vintage_is_stable(vintage, oo_hist):
+    """Returns True if the vintage's OO signals are within acceptable range
+    of the training-period average. Returns True (pass) when no history exists."""
+    gs = vintage['gsa_site']
+    if gs not in oo_hist:
+        return True
+    hist = oo_hist[gs]
+    train_cov = hist['oo_cov_avg']
+    train_bias = hist['oo_bias_avg']
+    test_cov = vintage['oo_coverage']
+    test_bias = vintage['oo_bias']
+    if train_cov - test_cov > OO_COV_DROP_THRESHOLD:
+        return False
+    if train_bias > 0.01 and test_bias / train_bias > OO_BIAS_RATIO_THRESHOLD:
+        return False
+    return True
+
+# ============================================================
 # Multi-vintage forecast registry (mirrors V8g)
 # ============================================================
 def build_forecast_registry(data_df):
@@ -129,6 +176,8 @@ def build_forecast_registry(data_df):
             'covered_orders': row['Covered_Orders'],
             'timeframe': row['Timeframe'],
             'gsa_site': row['gsa_site'],
+            'oo_coverage': row.get('OO_Coverage', 0.0),
+            'oo_bias': row.get('OO_Bias', 0.0),
         })
     for key in registry:
         registry[key].sort(key=lambda v: v['lag'])
@@ -169,15 +218,20 @@ SOURCES_FC_ANY = SOURCES_FC_CORRECTED | SOURCES_FC_RAW
 ALL_SOURCES = ['FC_MULTI_CORRECTED', 'FC_MULTI_RAW',
                'FC_SINGLE_CORRECTED', 'FC_SINGLE_RAW', 'HISTORICAL']
 
-def predict(test_df, cov_curve, bias_curve, hist, registry):
+def predict(test_df, cov_curve, bias_curve, hist, registry, oo_hist=None):
     """For each test row: combine all available vintages of its target period
-    (with ref_month <= test.Reference_Month and fc_value > 0). Label source by
-    (multi vs single) x (at least one corrected vs all raw), else HISTORICAL."""
+    (with ref_month <= test.Reference_Month and fc_value > 0).
+
+    OO shock detection: if oo_hist is provided, each vintage is checked against
+    the training-period OO baseline. Unstable vintages (coverage collapse or
+    bias spike) are excluded. Remaining vintages are combined as usual. If all
+    vintages are excluded, falls back to HISTORICAL."""
     n = len(test_df)
     preds = np.full(n, np.nan)
     sources = np.empty(n, dtype=object)
     n_vint = np.zeros(n, dtype=int)
     n_corrected_vint = np.zeros(n, dtype=int)
+    n_excluded_vint = np.zeros(n, dtype=int)
 
     for i, (_, row) in enumerate(test_df.iterrows()):
         gs = row['gsa_site']
@@ -187,13 +241,18 @@ def predict(test_df, cov_curve, bias_curve, hist, registry):
 
         if tp_key in registry:
             valid = []
+            excluded = 0
             for v in registry[tp_key]:
-                if v['ref_month'] > ref_m:  # temporal causality
+                if v['ref_month'] > ref_m:
+                    continue
+                if oo_hist is not None and not _vintage_is_stable(v, oo_hist):
+                    excluded += 1
                     continue
                 est, ok, corrected = _vintage_to_estimate(v, cov_curve, bias_curve)
                 if ok:
                     valid.append((max(est, 0), v['lag'], corrected))
 
+            n_excluded_vint[i] = excluded
             if valid:
                 n_vint[i] = len(valid)
                 n_corrected_vint[i] = sum(1 for _, _, c in valid if c)
@@ -218,6 +277,7 @@ def predict(test_df, cov_curve, bias_curve, hist, registry):
     out['Prediction_Source'] = sources
     out['N_Vintages'] = n_vint
     out['N_Corrected_Vintages'] = n_corrected_vint
+    out['N_Excluded_Vintages'] = n_excluded_vint
     out['Curve_Corrected'] = n_corrected_vint > 0
     return out
 
@@ -308,12 +368,14 @@ def run_snapshot(df, snapshot_date, horizon_months, verbose=True):
     bias_curve = build_flat_curves(curve_train, 'fc_bias')
     hist = build_historical(train)
     registry = build_forecast_registry(visible)
+    oo_hist = build_oo_history(train)
 
     if verbose:
         print(f"    Curves: cov={len(cov_curve):,}  bias={len(bias_curve):,}  hist={len(hist):,}")
         print(f"    Registry target-period keys: {len(registry):,}")
+        print(f"    OO history sites: {len(oo_hist):,}")
 
-    pred_df = predict(test, cov_curve, bias_curve, hist, registry)
+    pred_df = predict(test, cov_curve, bias_curve, hist, registry, oo_hist)
     metrics = score(pred_df)
     return metrics, pred_df
 
