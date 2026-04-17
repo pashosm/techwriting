@@ -1,3 +1,272 @@
+# V9: Forecast-Corrected Sales Prediction Model
+
+## Overview
+
+V9 predicts 12-month rolling sales for customer sites using bias-corrected
+customer forecasts as the primary signal, with historical sales as a fallback.
+It replaces V8's blended OO/FC approach with a deliberately simpler architecture
+that only makes predictions where it has learned how to correct the forecast.
+
+**Core principle**: use the customer's forecast only when we have enough history
+to know how wrong it typically is and can correct for that. When we don't know
+how to correct it, fall back to historical sales rather than pass through an
+uncorrected number.
+
+## Architecture
+
+### Prediction paths (in priority order)
+
+1. **FC_CORRECTED** — the customer issued a forecast, and we have >= 3
+   historical observations for this site/lag/regime to know how to correct it.
+   The correction formula: `estimate = Forecast_Value / (bias * coverage)`.
+
+2. **HISTORICAL** — no correctable forecast available. Use recency-weighted
+   average of historical actual sales.
+
+There is no raw/uncorrected forecast path. If we can't correct a forecast,
+we skip it.
+
+### Correction formula
+
+For each forecast vintage, the model divides by two learned curves:
+
+```
+estimate = Forecast_Value / (fc_bias * fc_coverage)
+```
+
+Where:
+- `fc_bias = Forecast_Value / Covered_Orders` (how much the forecast overshoots the order book)
+- `fc_coverage = Covered_Orders / Actual_Sales` (what fraction of actual sales the order book covers)
+- The product `fc_bias * fc_coverage = Forecast_Value / Actual_Sales`, so dividing by it converts the forecast into an unbiased sales estimate
+
+Both curves are recency-weighted means (RECENCY_POWER=2) computed per cell,
+requiring at least 3 valid historical observations (MIN_OBS_FLAT=3).
+
+### Cell key: 4-tuple
+
+Curves are keyed by `(gsa_site, Timeframe, Prediction_Lag, site_regime)`.
+
+- **No pooled fallback** for bias/coverage correction. If a specific cell
+  doesn't have 3 observations, we don't correct — we skip.
+- Historical fallback retains a site-level pool `('FB', gsa_site)` since
+  that's an independent signal, not a correction curve.
+
+### Multi-vintage combination
+
+When multiple forecast vintages exist for the same target period (e.g., lag 1,
+2, and 3 forecasts all visible at the snapshot date), they are combined via
+weighted average with `weight = 1 / lag^1.5` (VINTAGE_RECENCY_POWER=1.5).
+
+Constraints:
+- **MAX_VINTAGE_LAG = 3**: vintages older than lag 3 are excluded. Testing
+  showed that lag 4-6 vintages systematically drag bias negative due to drift
+  in the underlying bias/coverage ratios over time.
+- **forecast_error exclusion**: vintages flagged `forecast_error=True` (a
+  pre-computed column indicating unreliable forecasts based on OO bias
+  monitoring) are excluded before combination.
+- **Uncorrected vintages are skipped**: if a vintage's cell key doesn't have
+  a correction curve, it is dropped from combination rather than passed through
+  as raw forecast. This prevents regime-mismatch contamination (e.g., an
+  uncorrected regime-0 vintage dragging down a corrected regime-1 estimate).
+
+### Regime conditioning
+
+The `site_regime` column (0.0 or 1.0, pre-computed from OO coverage monitoring)
+splits correction curves by regime. A site that transitions from regime 0 to
+regime 1 gets fresh curves for the new regime, preventing stale regime-0
+corrections from being applied to regime-1 forecasts.
+
+### Ex-ante confidence flags
+
+Each FC_CORRECTED prediction is flagged as `HIGH_RISK` or `NORMAL` based on
+two signals computed at prediction time:
+
+| Signal | What it measures | Threshold |
+|---|---|---|
+| **Curve_CV** | Coefficient of variation of the cell's historical bias/coverage ratios. High CV = the correction was trained on noisy, unstable data. | > 0.50 |
+| **FC_Hist_Divergence** | abs(corrected_FC - historical) / historical. Large divergence = the forecast says something very different from the historical pattern. | > 0.50 |
+
+A prediction is `HIGH_RISK` if either signal exceeds its threshold.
+
+## Point-in-Time Evaluation
+
+The model uses point-in-time evaluation (no future leakage), unlike V8's
+random K-fold CV.
+
+At snapshot date T:
+- **Training rows**: `Target_Period_End < T` (outcome already known)
+- **Test rows**: `Target_Period_Start >= T`, `Reference_Month < T`, `Prediction_Lag == 1`
+- **Registry**: all FC vintages with `Reference_Month < T` (all lags up to MAX_VINTAGE_LAG)
+- **Curves**: built only from training rows with `Has_Forecast == 1`
+
+Evaluation runs a monthly snapshot grid (2024-06 through 2025-03) with a
+3-month test horizon per snapshot.
+
+## Results (10-snapshot grid, 2024-06 to 2025-03)
+
+### Overall
+
+| Signal | Rows/snapshot | WMAPE | Bias |
+|---|---|---|---|
+| **Overall** | ~246 | 30.7% | -7.8% |
+| **FC_Corrected** | ~27 | 22.2% | -5.1% |
+| **Historical** | ~214 | 33.5% | -9.1% |
+
+FC_Corrected covers ~12% of rows but ~25% of dollar value (larger sites tend
+to have forecast coverage).
+
+### Confidence flag separation
+
+| Flag | Rows/snapshot | WMAPE | Bias |
+|---|---|---|---|
+| **HIGH_RISK** | ~13 | 37.0% | variable |
+| **NORMAL** | ~14 | 18.0% | -5% to -10% |
+| **Separation** | | +19.0pp | |
+
+The flag reliably identifies predictions with elevated error risk.
+
+## Constants
+
+| Constant | Value | Purpose |
+|---|---|---|
+| RECENCY_POWER | 2 | Exponent for recency weighting in curve building |
+| MIN_OBS_FLAT | 3 | Minimum observations per cell to build a curve |
+| VINTAGE_RECENCY_POWER | 1.5 | Exponent for lag-based vintage weighting (1/lag^1.5) |
+| MAX_VINTAGE_LAG | 3 | Maximum vintage lag to include in combination |
+| CV_THRESHOLD | 0.50 | Curve CV above this triggers HIGH_RISK flag |
+| DIV_THRESHOLD | 0.50 | FC-vs-Historical divergence above this triggers HIGH_RISK flag |
+
+## Key Design Decisions and Rationale
+
+### 1. FC-only architecture (drop OO from prediction path)
+
+V8 blended Open Orders and Forecast signals, but the blend only worked because
+OO and FC had opposite biases that happened to cancel. Neither signal was
+individually reliable. V9 drops OO entirely from the prediction path and uses
+FC as the sole signal, corrected by learned bias/coverage curves.
+
+### 2. Skip uncorrected vintages (no raw FC passthrough)
+
+**Problem**: Early versions passed uncorrected forecasts through as raw values
+when no correction curve existed. This caused regime-mismatch contamination —
+e.g., a raw $1.3M forecast from regime 0 dragging down a corrected $49M
+estimate from regime 1.
+
+**Fix**: Uncorrected vintages return `(NaN, invalid)` and are excluded from
+combination. Sites without any correctable vintage fall to Historical.
+
+**Impact**: Overall WMAPE 41.0% -> 30.8%, Bias -28.1% -> -8.0%.
+
+### 3. MAX_VINTAGE_LAG reduced from 6 to 3
+
+**Problem**: Investigation of consistently under-predicting sites revealed
+significant drift in bias/coverage ratios over time. Older vintages (lag 4-6)
+were corrected using curves trained on historical data that no longer reflected
+current conditions. For example, Customer_02|Site_058 had FC/Actual ratios
+declining from ~0.95 to ~0.72 over 18 months.
+
+**Evidence**: Sweep across MAX_LAG values:
+
+| MAX_LAG | FC_C WMAPE | FC_C Bias | FC_C Rows |
+|---|---|---|---|
+| 1 | 19.3% | -1.3% | 187 |
+| 2 | 21.0% | -2.5% | 229 |
+| **3** | **21.9%** | **-4.0%** | **270** |
+| 6 | 22.7% | -5.2% | 290 |
+
+MAX_LAG=3 was chosen as a balance between accuracy and coverage — it captures
+most of the bias improvement (+1.2pp vs lag 6) while only losing 20 FC_C rows (7%).
+
+### 4. Regime conditioning via pre-computed site_regime
+
+**Problem**: Some sites undergo structural changes in their order book coverage
+(e.g., OO coverage jumping from 5% to 80%). Correction curves trained on the
+old regime become wildly inaccurate for the new one.
+
+**Fix**: The `site_regime` column (0.0 or 1.0, pre-computed from OO coverage
+monitoring) is added to the cell key. Curves are built separately per regime.
+When a site enters a new regime without enough history, its vintages are
+uncorrectable and skipped — which is the correct behavior, since we don't know
+how to correct forecasts under the new regime yet.
+
+### 5. Forecast error exclusion
+
+**Problem**: Some forecasts are flagged as unreliable based on OO bias
+monitoring (the `forecast_error` column, ~7.6% of FC rows).
+
+**Fix**: Vintages with `forecast_error=True` are excluded before combination.
+If all vintages for a target period are excluded, the prediction falls to
+Historical.
+
+### 6. OO shock detection explored and rejected
+
+Per-vintage OO shock detection was prototyped (compare test OO_Coverage and
+OO_Bias to training averages, flag outliers). Results were inconclusive:
+- The OO_Bias ratio check was fundamentally broken (median training OO_Bias = 0,
+  creating infinite ratios). 60% of all vintages were flagged.
+- The OO_Coverage drop check was nearly identical to baseline (+0.2% improvement).
+- The real signal was coverage *increases*, not drops — which the check missed.
+
+Reverted in favor of the simpler pre-computed `site_regime` and `forecast_error`
+columns.
+
+### 7. Multi-vintage combination retained (for now)
+
+Testing showed that using only the single most-recent vintage reduces WMAPE by
+~0.8pp but slightly worsens bias. Multi-vintage wins on bias (~$18M less bias
+across 10 snapshots) because averaging dampens individual errors. Single-vintage
+wins on WMAPE (~$50M less absolute error). The multi-vintage approach is retained
+as the more conservative choice, with single-vintage as a candidate for future
+simplification.
+
+### 8. Point-in-time evaluation (replacing K-fold CV)
+
+V8 used random K-fold cross-validation, which leaks future information into
+past predictions. V9 uses point-in-time snapshots: at each snapshot date,
+curves are built only from rows whose outcomes were already known, and
+predictions are made for rows whose target periods start after the snapshot.
+This matches real deployment conditions.
+
+## V9 Files
+
+| File | Purpose |
+|---|---|
+| `aging_v9.py` | Main model — load, build curves, predict, score, report |
+| `diag_curve_coverage.py` | Diagnostic: when does each site first qualify for FC_CORRECTED |
+| `diag_multi_vs_single.py` | Diagnostic: multi-vintage vs single-vintage comparison |
+| `training_data_anonymized.csv` | Input data |
+
+## Usage
+
+```bash
+# Single snapshot
+python aging_v9.py --snapshot 2024-12-01 --horizon 3
+
+# Monthly grid
+python aging_v9.py --grid 2024-06-01:2025-03-01 --horizon 3
+
+# Save per-row predictions
+python aging_v9.py --grid 2024-06-01:2025-03-01 --horizon 3 --save-predictions preds.csv
+```
+
+## Future Directions
+
+- **Single-vintage simplification**: drop multi-vintage combination, use only
+  the most recent correctable vintage. Trades ~$18M bias for ~$50M WMAPE
+  improvement per 10 snapshots.
+- **Historical path improvement**: the Historical signal has -9% consistent bias
+  (growth trend not captured). A trend adjustment could help but was deferred
+  to focus on FC_Corrected accuracy.
+- **Lag expansion**: currently evaluated on Prediction_Lag=1 only. Extending to
+  lag 2-3 test rows would broaden the evaluation scope.
+- **Confidence-flag-based routing**: use HIGH_RISK flag to fall back to
+  Historical for flagged rows, or blend FC and Historical weighted by confidence.
+- **Curve drift detection**: the correction curves drift over time at some sites.
+  A rolling-window or exponential-decay curve build could adapt faster than the
+  current recency-weighted mean.
+
+---
+
 # V8 Model Series — Demand Forecasting (Customer 1 & Customer 2)
 
 ## Overview
