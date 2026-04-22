@@ -44,6 +44,7 @@ VINTAGE_RECENCY_POWER = 1.5
 MAX_VINTAGE_LAG = 3
 CV_THRESHOLD = 0.50
 DIV_THRESHOLD = 0.50
+HIST_FC_FLOOR_RATIO = 0.10
 
 # Universe filter: applied in load_data. Every train/test/registry row must
 # satisfy this. tf=12 means we care only about 12-month target periods.
@@ -213,10 +214,11 @@ def _combine_vintage_estimates(estimates_with_lags):
 # Prediction
 # ============================================================
 SOURCES_FC_CORRECTED = {'FC_MULTI_CORRECTED', 'FC_SINGLE_CORRECTED'}
-SOURCES_FC_RAW = {'FC_MULTI_RAW', 'FC_SINGLE_RAW'}
+SOURCES_FC_RAW = {'FC_MULTI_RAW', 'FC_SINGLE_RAW', 'FC_RAW_FALLBACK'}
 SOURCES_FC_ANY = SOURCES_FC_CORRECTED | SOURCES_FC_RAW
 ALL_SOURCES = ['FC_MULTI_CORRECTED', 'FC_MULTI_RAW',
-               'FC_SINGLE_CORRECTED', 'FC_SINGLE_RAW', 'HISTORICAL']
+               'FC_SINGLE_CORRECTED', 'FC_SINGLE_RAW',
+               'FC_RAW_FALLBACK', 'HISTORICAL']
 
 def predict(test_df, cov_curve, bias_curve, hist, registry, curve_stats=None):
     """For each test row: combine all available vintages of its target period
@@ -291,9 +293,34 @@ def predict(test_df, cov_curve, bias_curve, hist, registry, curve_stats=None):
 
         # Historical fallback
         h = hist.get((gs, tf), hist.get(('FB', gs)))
+
+        # Raw FC fallback: use uncorrected forecast when history is missing
+        # or negligibly small (new site, site that scaled dramatically)
+        raw_fc = np.nan
+        if tp_key in registry:
+            raw_vals = []
+            for v in registry[tp_key]:
+                if v['ref_month'] > ref_m:
+                    continue
+                if v['lag'] > MAX_VINTAGE_LAG:
+                    continue
+                if v['forecast_error']:
+                    continue
+                if v['fc_value'] > 0:
+                    raw_vals.append((v['fc_value'], v['lag']))
+            if raw_vals:
+                raw_fc = max(_combine_vintage_estimates(raw_vals), 0)
+
         if h is not None and h > 0:
-            preds[i] = h
-            sources[i] = 'HISTORICAL'
+            if not np.isnan(raw_fc) and raw_fc > 0 and h < HIST_FC_FLOOR_RATIO * raw_fc:
+                preds[i] = raw_fc
+                sources[i] = 'FC_RAW_FALLBACK'
+            else:
+                preds[i] = h
+                sources[i] = 'HISTORICAL'
+        elif not np.isnan(raw_fc) and raw_fc > 0:
+            preds[i] = raw_fc
+            sources[i] = 'FC_RAW_FALLBACK'
 
     out = test_df.copy()
     out['Prediction'] = preds
