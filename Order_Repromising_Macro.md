@@ -80,15 +80,16 @@ leftover inventory, run timestamp).
 
 Only the **supply** column is selectable at run time (via the B2 dropdown), per
 the agreed design — demand columns are fixed and orders are processed in row
-order. To add another supply scenario:
+order. To add another supply scenario, just:
 
 1. Add a new column on the **Supply** sheet: put the scenario name in row 1 and
    the weekly quantities below it.
-2. Add that name to the **B2** dropdown list (Data ▸ Data Validation on the
-   Control sheet).
 
-The macro finds the selected scenario by matching the name in the Supply header
-row, so any number of scenario columns is supported.
+That's it — the **B2 dropdown updates automatically**. It's driven by a dynamic
+named range (`ScenarioList` = `OFFSET(Supply!$C$1,0,0,1,COUNTA(Supply!$1:$1)-2)`)
+that spans every header from column C onward, so any number of contiguous
+scenario columns is picked up with no dropdown editing. The macro then matches
+the selected name against the Supply header row to find the right column.
 
 ## Sample data at a glance
 
